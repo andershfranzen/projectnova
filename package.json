@@ -1,0 +1,11 @@
+{
+  "name": "projectrs",
+  "private": true,
+  "workspaces": ["shared", "server", "client"],
+  "scripts": {
+    "dev:client": "cd client && bunx vite --port 5173",
+    "dev:server": "bun --watch server/src/main.ts",
+    "build:client": "cd client && bunx vite build",
+    "start": "bun server/src/main.ts"
+  }
+}

@@ -1,0 +1,28 @@
+// Client → Server opcodes
+export enum ClientOpcode {
+  LOGIN = 1,
+  LOGOUT = 2,
+  PLAYER_MOVE = 10,
+  PLAYER_ATTACK_NPC = 20,
+  PLAYER_TALK_NPC = 21,
+  PLAYER_PICKUP_ITEM = 30,
+  PLAYER_DROP_ITEM = 31,
+  PLAYER_EQUIP_ITEM = 32,
+  PLAYER_UNEQUIP_ITEM = 33,
+}
+
+// Server → Client opcodes
+export enum ServerOpcode {
+  LOGIN_OK = 1,
+  LOGIN_FAIL = 2,
+  PLAYER_SYNC = 10,
+  NPC_SYNC = 11,
+  GROUND_ITEM_SYNC = 12,
+  PLAYER_INVENTORY = 20,
+  PLAYER_STATS = 21,
+  COMBAT_HIT = 30,
+  ENTITY_DEATH = 31,
+  CHAT_LOCAL = 40,
+  CHAT_PRIVATE = 41,
+  CHAT_SYSTEM = 42,
+}

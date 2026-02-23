@@ -1,0 +1,10 @@
+export const TICK_RATE = 600; // ms per game tick
+export const MAP_SIZE = 64; // tiles per side
+export const TILE_SIZE = 1; // world units per tile
+export const MAX_PLAYERS = 256;
+export const MAX_NPCS = 512;
+export const INVENTORY_SIZE = 28;
+export const VIEW_DISTANCE = 15; // tiles
+export const SERVER_PORT = 3000;
+export const GAME_WS_PATH = '/ws/game';
+export const CHAT_WS_PATH = '/ws/chat';
