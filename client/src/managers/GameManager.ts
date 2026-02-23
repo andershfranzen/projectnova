@@ -1,0 +1,892 @@
+import { Engine } from '@babylonjs/core/Engines/engine';
+import { Scene } from '@babylonjs/core/scene';
+import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight';
+import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight';
+import { Vector3, Color3, Color4, Matrix } from '@babylonjs/core/Maths/math';
+import { Viewport } from '@babylonjs/core/Maths/math.viewport';
+import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
+import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
+import { Terrain } from '../rendering/Terrain';
+import { GameCamera } from '../rendering/Camera';
+import { SpriteEntity } from '../rendering/SpriteEntity';
+import { InputManager } from './InputManager';
+import { NetworkManager } from './NetworkManager';
+import { findPath } from '../rendering/Pathfinding';
+import { SidePanel } from '../ui/SidePanel';
+import { ChatPanel } from '../ui/ChatPanel';
+import { Minimap } from '../ui/Minimap';
+import { StatsPanel } from '../ui/StatsPanel';
+import { MAP_SIZE, ServerOpcode, ClientOpcode, encodePacket, ALL_SKILLS, SKILL_NAMES, getInterpolatedHeight } from '@projectrs/shared';
+
+// NPC color palette by definition ID
+const NPC_COLORS: Record<number, Color3> = {
+  1: new Color3(0.9, 0.9, 0.8),   // Chicken — white
+  2: new Color3(0.5, 0.4, 0.3),   // Rat — brown
+  3: new Color3(0.3, 0.5, 0.2),   // Goblin — green
+  4: new Color3(0.5, 0.5, 0.5),   // Wolf — grey
+  5: new Color3(0.85, 0.85, 0.8), // Skeleton — bone white
+  6: new Color3(0.3, 0.2, 0.1),   // Spider — dark brown
+  7: new Color3(0.6, 0.6, 0.65),  // Guard — silver
+  8: new Color3(0.7, 0.5, 0.2),   // Shopkeeper — gold
+  9: new Color3(0.15, 0.1, 0.2),  // Dark Knight — dark purple
+};
+
+const NPC_NAMES: Record<number, string> = {
+  1: 'Chicken', 2: 'Rat', 3: 'Goblin', 4: 'Wolf',
+  5: 'Skeleton', 6: 'Spider', 7: 'Guard', 8: 'Shopkeeper',
+  9: 'Dark Knight',
+};
+
+const NPC_SIZES: Record<number, { w: number; h: number }> = {
+  1: { w: 0.5, h: 0.6 },  // Chicken (small)
+  2: { w: 0.5, h: 0.7 },  // Rat (small)
+  6: { w: 0.6, h: 0.5 },  // Spider (wide, short)
+  9: { w: 1.0, h: 1.8 },  // Dark Knight (big)
+};
+
+interface GroundItemData {
+  id: number;
+  itemId: number;
+  quantity: number;
+  x: number;
+  z: number;
+}
+
+export class GameManager {
+  private engine: Engine;
+  private scene: Scene;
+  private camera: GameCamera;
+  private terrain: Terrain;
+  private inputManager: InputManager;
+  private network: NetworkManager;
+
+  // Auth
+  private token: string;
+  private username: string;
+
+  // Local player
+  private localPlayer: SpriteEntity | null = null;
+  private localPlayerId: number = -1;
+  private playerX: number = MAP_SIZE / 2;
+  private playerZ: number = MAP_SIZE / 2;
+  private playerHealth: number = 10;
+  private playerMaxHealth: number = 10;
+
+  // Movement
+  private path: { x: number; z: number }[] = [];
+  private moveSpeed: number = 3.0;
+
+  // Combat follow (local player follows melee target)
+  private combatTargetId: number = -1;
+
+  // Remote players
+  private remotePlayers: Map<number, SpriteEntity> = new Map();
+  private remoteTargets: Map<number, { x: number; z: number }> = new Map();
+  private playerNames: Map<number, string> = new Map(); // entityId -> name
+  private nameToEntityId: Map<string, number> = new Map(); // name (lowercase) -> entityId
+
+  // NPCs
+  private npcSprites: Map<number, SpriteEntity> = new Map();
+  private npcTargets: Map<number, { x: number; z: number }> = new Map();
+  private npcDefs: Map<number, number> = new Map();
+
+  // Ground items
+  private groundItems: Map<number, GroundItemData> = new Map();
+  private groundItemSprites: Map<number, SpriteEntity> = new Map();
+
+  // UI
+  private destMarker: any = null;
+  private contextMenu: HTMLDivElement | null = null;
+  private sidePanel: SidePanel | null = null;
+  private chatPanel: ChatPanel | null = null;
+  private minimap: Minimap | null = null;
+  private statsPanel: StatsPanel | null = null;
+
+  // Combat hit splats (HTML overlay)
+  private hitSplats: { worldPos: Vector3; el: HTMLDivElement; timer: number; startY: number }[] = [];
+
+  // WASD camera
+  private keysDown: Set<string> = new Set();
+
+  constructor(canvas: HTMLCanvasElement, token: string, username: string, onDisconnect?: () => void) {
+    this.token = token;
+    this.username = username;
+
+    this.engine = new Engine(canvas, true, { antialias: true });
+    this.scene = new Scene(this.engine);
+    this.scene.clearColor = new Color4(0.4, 0.6, 0.9, 1.0);
+
+    // Lighting
+    const ambient = new HemisphericLight('ambient', new Vector3(0, 1, 0), this.scene);
+    ambient.intensity = 0.5;
+    ambient.groundColor = new Color3(0.3, 0.3, 0.35);
+    const sun = new DirectionalLight('sun', new Vector3(-0.5, -1, -0.3), this.scene);
+    sun.intensity = 0.8;
+
+    // Camera
+    this.camera = new GameCamera(this.scene, canvas);
+
+    // Terrain
+    this.terrain = new Terrain(this.scene);
+
+    // Destination marker
+    this.createDestinationMarker();
+
+    // Input — left click for movement
+    this.inputManager = new InputManager(this.scene, this.terrain.getMesh());
+    this.inputManager.setGroundClickHandler((worldX, worldZ) => {
+      this.handleGroundClick(worldX, worldZ);
+    });
+
+    // Right-click context menu for NPCs/items
+    this.setupContextMenu(canvas);
+
+    // WASD keyboard controls
+    this.setupKeyboard();
+
+    // Network
+    this.network = new NetworkManager();
+    this.setupNetworkHandlers();
+    this.network.connect(token);
+    if (onDisconnect) {
+      this.network.onDisconnect(onDisconnect);
+    }
+
+    // HUD
+    this.createHUD();
+    this.sidePanel = new SidePanel(this.network, this.token);
+    this.chatPanel = new ChatPanel();
+    this.chatPanel.setSendHandler((msg) => this.network.sendChat(msg));
+    this.chatPanel.addSystemMessage(`Welcome, ${username}! Click to move, right-click NPCs to attack.`, '#0f0');
+
+    // Chat message handler
+    this.network.onChat((data) => {
+      switch (data.type) {
+        case 'player_info': {
+          // Server tells us entityId → name
+          const entityId = (data as any).entityId as number;
+          const name = (data as any).name as string;
+          this.playerNames.set(entityId, name);
+          this.nameToEntityId.set(name.toLowerCase(), entityId);
+          // Update existing sprite label if we already have one
+          const existing = this.remotePlayers.get(entityId);
+          if (existing) {
+            // Re-create sprite with correct name
+            const target = this.remoteTargets.get(entityId);
+            existing.dispose();
+            const sprite = new SpriteEntity(this.scene, {
+              name: `player_${entityId}`,
+              color: new Color3(0.8, 0.2, 0.2),
+              label: name,
+              labelColor: '#ffffff',
+            });
+            if (target) {
+              sprite.position = new Vector3(target.x, getInterpolatedHeight(target.x, target.z), target.z);
+            }
+            this.remotePlayers.set(entityId, sprite);
+          }
+          break;
+        }
+        case 'local': {
+          if (this.chatPanel) {
+            this.chatPanel.addMessage(data.from || '???', data.message, '#fff');
+          }
+          // Show chat bubble above the speaking player
+          this.showPlayerChatBubble(data.from || '', data.message);
+          break;
+        }
+        case 'private':
+          if (this.chatPanel) this.chatPanel.addMessage(`[PM] ${data.from}`, data.message, '#c0f');
+          break;
+        case 'private_sent':
+          if (this.chatPanel) this.chatPanel.addMessage(`[PM] To ${data.to}`, data.message, '#c0f');
+          break;
+        case 'system':
+          if (this.chatPanel) this.chatPanel.addSystemMessage(data.message, '#ff0');
+          break;
+      }
+    });
+
+    // Game loop
+    let lastTime = performance.now();
+    this.engine.runRenderLoop(() => {
+      const now = performance.now();
+      const dt = (now - lastTime) / 1000;
+      lastTime = now;
+      this.update(dt);
+      this.scene.render();
+    });
+
+    window.addEventListener('resize', () => this.engine.resize());
+  }
+
+  private setupKeyboard(): void {
+    window.addEventListener('keydown', (e) => {
+      // Don't capture when typing in chat
+      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+      this.keysDown.add(e.key.toLowerCase());
+    });
+    window.addEventListener('keyup', (e) => {
+      this.keysDown.delete(e.key.toLowerCase());
+    });
+  }
+
+  private setupNetworkHandlers(): void {
+    this.network.on(ServerOpcode.LOGIN_OK, (_op, v) => {
+      this.localPlayerId = v[0];
+      this.playerX = v[1] / 10;
+      this.playerZ = v[2] / 10;
+      this.network.setLocalPlayerId(this.localPlayerId);
+
+      this.localPlayer = new SpriteEntity(this.scene, {
+        name: 'localPlayer',
+        color: new Color3(0.2, 0.4, 0.9),
+        label: this.username,
+        labelColor: '#00ff00',
+      });
+      this.localPlayer.position = new Vector3(this.playerX, getInterpolatedHeight(this.playerX, this.playerZ), this.playerZ);
+      console.log(`Logged in as player ${this.localPlayerId}`);
+    });
+
+    this.network.on(ServerOpcode.PLAYER_SYNC, (_op, v) => {
+      const [entityId, x10, z10, health, maxHealth] = v;
+      const x = x10 / 10;
+      const z = z10 / 10;
+
+      if (entityId === this.localPlayerId) {
+        this.playerHealth = health;
+        this.playerMaxHealth = maxHealth;
+        this.updateHUD();
+        // Show/hide health bar above local player (visible to self and already sent to others via PLAYER_SYNC)
+        if (this.localPlayer) {
+          if (health < maxHealth) {
+            this.localPlayer.showHealthBar(health, maxHealth);
+          } else {
+            this.localPlayer.hideHealthBar();
+          }
+        }
+        // Don't correct position — client path prediction is authoritative for visuals.
+        // Server handles game logic (combat range, pickups) with its own position.
+        return;
+      }
+
+      if (!this.remotePlayers.has(entityId)) {
+        const playerName = this.playerNames.get(entityId) || 'Player';
+        const sprite = new SpriteEntity(this.scene, {
+          name: `player_${entityId}`,
+          color: new Color3(0.8, 0.2, 0.2),
+          label: playerName,
+          labelColor: '#ffffff',
+        });
+        sprite.position = new Vector3(x, getInterpolatedHeight(x, z), z);
+        this.remotePlayers.set(entityId, sprite);
+      }
+      this.remoteTargets.set(entityId, { x, z });
+      const sprite = this.remotePlayers.get(entityId)!;
+      if (health < maxHealth) {
+        sprite.showHealthBar(health, maxHealth);
+      } else {
+        sprite.hideHealthBar();
+      }
+    });
+
+    this.network.on(ServerOpcode.NPC_SYNC, (_op, v) => {
+      const [entityId, npcDefId, x10, z10, health, maxHealth] = v;
+      const x = x10 / 10;
+      const z = z10 / 10;
+
+      this.npcDefs.set(entityId, npcDefId);
+
+      if (!this.npcSprites.has(entityId)) {
+        const color = NPC_COLORS[npcDefId] || new Color3(0.5, 0.5, 0.5);
+        const name = NPC_NAMES[npcDefId] || `NPC${npcDefId}`;
+        const size = NPC_SIZES[npcDefId] || { w: 0.8, h: 1.4 };
+        const sprite = new SpriteEntity(this.scene, {
+          name: `npc_${entityId}`,
+          color,
+          label: name,
+          labelColor: '#ffff00',
+          width: size.w,
+          height: size.h,
+        });
+        sprite.position = new Vector3(x, getInterpolatedHeight(x, z), z);
+        this.npcSprites.set(entityId, sprite);
+      }
+
+      this.npcTargets.set(entityId, { x, z });
+
+      const sprite = this.npcSprites.get(entityId)!;
+      if (health < maxHealth) {
+        sprite.showHealthBar(health, maxHealth);
+      } else {
+        sprite.hideHealthBar();
+      }
+    });
+
+    this.network.on(ServerOpcode.GROUND_ITEM_SYNC, (_op, v) => {
+      const [groundItemId, itemId, quantity, x10, z10] = v;
+      if (itemId === 0) {
+        const sprite = this.groundItemSprites.get(groundItemId);
+        if (sprite) {
+          sprite.dispose();
+          this.groundItemSprites.delete(groundItemId);
+        }
+        this.groundItems.delete(groundItemId);
+        return;
+      }
+
+      const x = x10 / 10;
+      const z = z10 / 10;
+      this.groundItems.set(groundItemId, { id: groundItemId, itemId, quantity, x, z });
+
+      if (!this.groundItemSprites.has(groundItemId)) {
+        const sprite = new SpriteEntity(this.scene, {
+          name: `gitem_${groundItemId}`,
+          color: new Color3(0.8, 0.7, 0.2),
+          label: `Item`,
+          labelColor: '#ffaa00',
+          width: 0.4,
+          height: 0.4,
+        });
+        sprite.position = new Vector3(x, getInterpolatedHeight(x, z), z);
+        this.groundItemSprites.set(groundItemId, sprite);
+      }
+    });
+
+    this.network.on(ServerOpcode.ENTITY_DEATH, (_op, v) => {
+      const entityId = v[0];
+
+      // Clear combat follow if our target died
+      if (entityId === this.combatTargetId) {
+        this.combatTargetId = -1;
+      }
+
+      const playerSprite = this.remotePlayers.get(entityId);
+      if (playerSprite) {
+        playerSprite.dispose();
+        this.remotePlayers.delete(entityId);
+        this.remoteTargets.delete(entityId);
+        const name = this.playerNames.get(entityId);
+        if (name) this.nameToEntityId.delete(name.toLowerCase());
+        this.playerNames.delete(entityId);
+      }
+
+      const npcSprite = this.npcSprites.get(entityId);
+      if (npcSprite) {
+        npcSprite.dispose();
+        this.npcSprites.delete(entityId);
+        this.npcTargets.delete(entityId);
+        this.npcDefs.delete(entityId);
+      }
+    });
+
+    this.network.on(ServerOpcode.COMBAT_HIT, (_op, v) => {
+      const [_attackerId, targetId, damage, targetHp, targetMaxHp] = v;
+      const targetSprite = this.npcSprites.get(targetId) || this.remotePlayers.get(targetId);
+      if (targetSprite) {
+        this.showHitSplat(targetSprite.position, damage);
+      }
+      if (targetId === this.localPlayerId && this.localPlayer) {
+        this.showHitSplat(this.localPlayer.position, damage);
+        this.playerHealth = targetHp;
+        this.playerMaxHealth = targetMaxHp;
+        this.updateHUD();
+        if (targetHp < targetMaxHp) {
+          this.localPlayer.showHealthBar(targetHp, targetMaxHp);
+        } else {
+          this.localPlayer.hideHealthBar();
+        }
+      }
+    });
+
+    this.network.on(ServerOpcode.PLAYER_STATS, (_op, v) => {
+      this.playerHealth = v[0];
+      this.playerMaxHealth = v[1];
+      this.updateHUD();
+    });
+
+    this.network.on(ServerOpcode.PLAYER_INVENTORY, (_op, v) => {
+      const [slotIndex, itemId, quantity] = v;
+      if (this.sidePanel) {
+        this.sidePanel.updateInvSlot(slotIndex, itemId, quantity);
+      }
+    });
+
+    this.network.on(ServerOpcode.PLAYER_SKILLS, (_op, v) => {
+      const [skillIndex, level, currentLevel, xpHigh, xpLow] = v;
+      const xp = (xpHigh << 16) | (xpLow & 0xFFFF);
+      if (this.sidePanel) {
+        this.sidePanel.updateSkill(skillIndex, level, currentLevel, xp);
+      }
+      // Update HP from hitpoints skill
+      if (skillIndex === ALL_SKILLS.indexOf('hitpoints')) {
+        this.playerHealth = currentLevel;
+        this.playerMaxHealth = level;
+        this.updateHUD();
+      }
+    });
+
+    this.network.on(ServerOpcode.PLAYER_EQUIPMENT, (_op, v) => {
+      const [slotIndex, itemId] = v;
+      if (this.sidePanel) {
+        this.sidePanel.updateEquipSlot(slotIndex, itemId);
+      }
+    });
+
+    this.network.on(ServerOpcode.XP_GAIN, (_op, v) => {
+      const [skillIndex, amount] = v;
+      if (skillIndex >= 0 && skillIndex < ALL_SKILLS.length) {
+        const skillName = SKILL_NAMES[ALL_SKILLS[skillIndex]];
+        if (this.chatPanel && amount > 0) {
+          this.chatPanel.addSystemMessage(`+${amount} ${skillName} XP`, '#8f8');
+        }
+      }
+    });
+
+    this.network.on(ServerOpcode.LEVEL_UP, (_op, v) => {
+      const [skillIndex, newLevel] = v;
+      if (skillIndex >= 0 && skillIndex < ALL_SKILLS.length) {
+        const skillName = SKILL_NAMES[ALL_SKILLS[skillIndex]];
+        if (this.chatPanel) {
+          this.chatPanel.addSystemMessage(`Level up! ${skillName} is now level ${newLevel}!`, '#ff0');
+        }
+      }
+    });
+  }
+
+  private setupContextMenu(canvas: HTMLCanvasElement): void {
+    canvas.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      this.hideContextMenu();
+
+      const pickResult = this.scene.pick(this.scene.pointerX, this.scene.pointerY);
+      if (!pickResult?.hit || !pickResult.pickedMesh) return;
+
+      const meshName = pickResult.pickedMesh.name;
+      const options: { label: string; action: () => void }[] = [];
+
+      for (const [entityId, sprite] of this.npcSprites) {
+        if (sprite.getMesh().name === meshName) {
+          const npcDefId = this.npcDefs.get(entityId);
+          const name = NPC_NAMES[npcDefId || 0] || 'NPC';
+          options.push({
+            label: `Attack ${name}`,
+            action: () => this.attackNpc(entityId),
+          });
+          if (npcDefId === 8) { // Shopkeeper
+            options.push({
+              label: `Talk-to ${name}`,
+              action: () => {
+                if (this.chatPanel) this.chatPanel.addSystemMessage('The shopkeeper nods at you.', '#ff0');
+              },
+            });
+          }
+          break;
+        }
+      }
+
+      for (const [groundItemId, sprite] of this.groundItemSprites) {
+        if (sprite.getMesh().name === meshName) {
+          options.push({
+            label: `Pick up item`,
+            action: () => this.pickupItem(groundItemId),
+          });
+          break;
+        }
+      }
+
+      if (options.length > 0) {
+        this.showContextMenu(e.clientX, e.clientY, options);
+      }
+    });
+  }
+
+  private showContextMenu(x: number, y: number, options: { label: string; action: () => void }[]): void {
+    this.hideContextMenu();
+
+    const menu = document.createElement('div');
+    menu.style.cssText = `
+      position: fixed; left: ${x}px; top: ${y}px;
+      background: #3a3125; border: 2px solid #5a4a35;
+      font-family: monospace; font-size: 13px; z-index: 1000;
+      min-width: 120px; box-shadow: 2px 2px 8px rgba(0,0,0,0.5);
+    `;
+
+    for (const opt of options) {
+      const item = document.createElement('div');
+      item.textContent = opt.label;
+      item.style.cssText = `padding: 4px 12px; color: #ffcc00; cursor: pointer;`;
+      item.addEventListener('mouseenter', () => item.style.background = '#5a4a35');
+      item.addEventListener('mouseleave', () => item.style.background = 'transparent');
+      item.addEventListener('click', () => {
+        opt.action();
+        this.hideContextMenu();
+      });
+      menu.appendChild(item);
+    }
+
+    document.body.appendChild(menu);
+    this.contextMenu = menu;
+
+    const closeHandler = () => {
+      this.hideContextMenu();
+      document.removeEventListener('click', closeHandler);
+    };
+    setTimeout(() => document.addEventListener('click', closeHandler), 0);
+  }
+
+  private hideContextMenu(): void {
+    if (this.contextMenu) {
+      this.contextMenu.remove();
+      this.contextMenu = null;
+    }
+  }
+
+  private attackNpc(npcEntityId: number): void {
+    this.combatTargetId = npcEntityId;
+    this.network.sendRaw(encodePacket(ClientOpcode.PLAYER_ATTACK_NPC, npcEntityId));
+
+    // Path toward the NPC (stop adjacent, don't walk onto their tile)
+    const target = this.npcTargets.get(npcEntityId);
+    if (target) {
+      const path = findPath(this.playerX, this.playerZ, target.x, target.z,
+        (x, z) => this.terrain.isBlocked(x, z));
+      // Remove the last step if it's on the NPC's tile
+      if (path.length > 1) {
+        const last = path[path.length - 1];
+        if (Math.floor(last.x) === Math.floor(target.x) && Math.floor(last.z) === Math.floor(target.z)) {
+          path.pop();
+        }
+      }
+      if (path.length > 0) {
+        this.path = path;
+        this.destMarker.isVisible = false;
+      }
+    }
+  }
+
+  private pickupItem(groundItemId: number): void {
+    this.network.sendRaw(encodePacket(ClientOpcode.PLAYER_PICKUP_ITEM, groundItemId));
+  }
+
+  private showPlayerChatBubble(fromName: string, message: string): void {
+    if (!fromName) return;
+
+    // Check if it's the local player
+    if (fromName.toLowerCase() === this.username.toLowerCase()) {
+      if (this.localPlayer) {
+        this.localPlayer.showChatBubble(message);
+      }
+      return;
+    }
+
+    // Find remote player by name
+    const entityId = this.nameToEntityId.get(fromName.toLowerCase());
+    if (entityId !== undefined) {
+      const sprite = this.remotePlayers.get(entityId);
+      if (sprite) {
+        sprite.showChatBubble(message);
+      }
+    }
+  }
+
+  private showHitSplat(pos: Vector3, damage: number): void {
+    const el = document.createElement('div');
+    el.style.cssText = `
+      position: fixed; pointer-events: none; z-index: 250;
+      width: 32px; height: 32px;
+      transform: translate(-50%, -50%);
+      display: flex; align-items: center; justify-content: center;
+      image-rendering: pixelated;
+      transition: opacity 0.3s ease-out;
+    `;
+
+    // Hitsplash sprite background
+    const img = document.createElement('img');
+    img.src = damage > 0 ? '/sprites/effects/hitsplash.png' : '/sprites/effects/nohitsplash.png';
+    img.style.cssText = `
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      image-rendering: pixelated; pointer-events: none;
+    `;
+    el.appendChild(img);
+
+    // Damage number
+    const numEl = document.createElement('span');
+    numEl.textContent = damage.toString();
+    numEl.style.cssText = `
+      position: relative; z-index: 1;
+      color: #fff; font-family: monospace; font-size: 13px; font-weight: bold;
+      text-shadow: 1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000;
+    `;
+    el.appendChild(numEl);
+
+    document.body.appendChild(el);
+
+    const worldPos = new Vector3(
+      pos.x + (Math.random() - 0.5) * 0.3,
+      pos.y + 1.5,
+      pos.z
+    );
+
+    this.hitSplats.push({
+      worldPos,
+      el,
+      timer: 1.2,
+      startY: worldPos.y,
+    });
+  }
+
+  private createDestinationMarker(): void {
+    const marker = MeshBuilder.CreateDisc('destMarker', { radius: 0.3, tessellation: 6 }, this.scene);
+    marker.rotation.x = Math.PI / 2;
+    marker.isVisible = false;
+    const mat = new StandardMaterial('destMarkerMat', this.scene);
+    mat.diffuseColor = new Color3(1, 1, 0);
+    mat.emissiveColor = new Color3(0.5, 0.5, 0);
+    mat.specularColor = Color3.Black();
+    marker.material = mat;
+    this.destMarker = marker;
+  }
+
+  private handleGroundClick(worldX: number, worldZ: number): void {
+    this.combatTargetId = -1; // Cancel combat follow on manual move
+
+    const path = findPath(this.playerX, this.playerZ, worldX, worldZ,
+      (x, z) => this.terrain.isBlocked(x, z));
+
+    if (path.length > 0) {
+      this.path = path;
+      const dest = path[path.length - 1];
+      this.destMarker.position.x = dest.x;
+      this.destMarker.position.y = getInterpolatedHeight(dest.x, dest.z) + 0.02;
+      this.destMarker.position.z = dest.z;
+      this.destMarker.isVisible = true;
+      this.network.sendMove(path);
+    }
+  }
+
+  private createHUD(): void {
+    this.statsPanel = new StatsPanel();
+    this.minimap = new Minimap(150);
+    this.minimap.generateFromTiles(this.terrain.getTiles());
+  }
+
+  destroy(): void {
+    this.engine.stopRenderLoop();
+    this.engine.dispose();
+    // Remove UI elements
+    document.getElementById('chat-panel')?.remove();
+    document.getElementById('side-panel')?.remove();
+    // Remove all hit splat overlays
+    for (const splat of this.hitSplats) splat.el.remove();
+    this.hitSplats = [];
+    // Remove chat bubble and health bar overlays
+    document.querySelectorAll('.chat-bubble-overlay').forEach(el => el.remove());
+    document.querySelectorAll('.entity-health-bar').forEach(el => el.remove());
+  }
+
+  private updateOverlayPositions(): void {
+    const cam = this.scene.activeCamera;
+    if (!cam) return;
+
+    const engine = this.engine;
+    const w = engine.getRenderWidth();
+    const h = engine.getRenderHeight();
+    const viewMatrix = cam.getViewMatrix();
+    const projMatrix = cam.getProjectionMatrix();
+    const transform = viewMatrix.multiply(projMatrix);
+    const viewport = new Viewport(0, 0, w, h);
+
+    // Collect all sprites for overlay updates
+    const allSprites: SpriteEntity[] = [];
+    if (this.localPlayer) allSprites.push(this.localPlayer);
+    for (const [, sprite] of this.remotePlayers) allSprites.push(sprite);
+    for (const [, sprite] of this.npcSprites) allSprites.push(sprite);
+
+    for (const sprite of allSprites) {
+      // Chat bubbles
+      if (sprite.hasChatBubble()) {
+        const worldPos = sprite.getChatBubbleWorldPos();
+        if (worldPos) {
+          const screenPos = Vector3.Project(worldPos, Matrix.Identity(), transform, viewport);
+          sprite.updateChatBubbleScreenPos(screenPos.x, screenPos.y);
+        }
+      }
+
+      // Health bars
+      if (sprite.hasHealthBar()) {
+        const worldPos = sprite.getHealthBarWorldPos();
+        if (worldPos) {
+          const screenPos = Vector3.Project(worldPos, Matrix.Identity(), transform, viewport);
+          sprite.updateHealthBarScreenPos(screenPos.x, screenPos.y);
+        }
+      }
+    }
+  }
+
+  private updateHUD(): void {
+    if (this.statsPanel) {
+      this.statsPanel.updateHealth(this.playerHealth, this.playerMaxHealth);
+    }
+  }
+
+  private update(dt: number): void {
+    // WASD camera rotation
+    const camSpeed = 2.0 * dt;
+    const cam = this.camera.getCamera();
+    if (this.keysDown.has('a') || this.keysDown.has('arrowleft')) cam.alpha -= camSpeed;
+    if (this.keysDown.has('d') || this.keysDown.has('arrowright')) cam.alpha += camSpeed;
+    if (this.keysDown.has('w') || this.keysDown.has('arrowup')) cam.beta = Math.max(0.2, cam.beta - camSpeed);
+    if (this.keysDown.has('s') || this.keysDown.has('arrowdown')) cam.beta = Math.min(Math.PI / 2.2, cam.beta + camSpeed);
+
+    // Combat follow — re-path toward melee target if it moved
+    if (this.combatTargetId >= 0 && this.localPlayer) {
+      const npcTarget = this.npcTargets.get(this.combatTargetId);
+      if (npcTarget) {
+        const dx = npcTarget.x - this.playerX;
+        const dz = npcTarget.z - this.playerZ;
+        const dist = Math.hypot(dx, dz);
+        if (dist > 1.5) {
+          // Re-path toward the NPC if we've finished our current path or are too far
+          if (this.path.length === 0 || dist > 3) {
+            const newPath = findPath(this.playerX, this.playerZ, npcTarget.x, npcTarget.z,
+              (x, z) => this.terrain.isBlocked(x, z));
+            // Remove last step if it's on the NPC's tile (stop adjacent)
+            if (newPath.length > 1) {
+              const last = newPath[newPath.length - 1];
+              if (Math.floor(last.x) === Math.floor(npcTarget.x) && Math.floor(last.z) === Math.floor(npcTarget.z)) {
+                newPath.pop();
+              }
+            }
+            if (newPath.length > 0) {
+              this.path = newPath;
+              this.destMarker.isVisible = false;
+            }
+          }
+        }
+      }
+    }
+
+    // Move local player — smooth client-side path following
+    if (this.path.length > 0 && this.localPlayer) {
+      // In combat: stop if already adjacent to target (don't walk on top)
+      if (this.combatTargetId >= 0) {
+        const npcTarget = this.npcTargets.get(this.combatTargetId);
+        if (npcTarget) {
+          const toDist = Math.hypot(npcTarget.x - this.playerX, npcTarget.z - this.playerZ);
+          if (toDist <= 1.5) {
+            this.path = [];
+            // Snap to nearest tile center so we don't freeze between tiles
+            this.playerX = Math.floor(this.playerX) + 0.5;
+            this.playerZ = Math.floor(this.playerZ) + 0.5;
+            this.localPlayer!.position = new Vector3(this.playerX, getInterpolatedHeight(this.playerX, this.playerZ), this.playerZ);
+          }
+        }
+      }
+
+      if (this.path.length > 0) {
+        const target = this.path[0];
+        const dx = target.x - this.playerX;
+        const dz = target.z - this.playerZ;
+        const dist = Math.hypot(dx, dz);
+        const step = this.moveSpeed * dt;
+
+        if (dist <= step) {
+          this.playerX = target.x;
+          this.playerZ = target.z;
+          this.path.shift();
+          if (this.path.length === 0) this.destMarker.isVisible = false;
+        } else {
+          this.playerX += (dx / dist) * step;
+          this.playerZ += (dz / dist) * step;
+        }
+        this.localPlayer.position = new Vector3(this.playerX, getInterpolatedHeight(this.playerX, this.playerZ), this.playerZ);
+      }
+    }
+
+    // Interpolate remote players
+    for (const [entityId, sprite] of this.remotePlayers) {
+      const target = this.remoteTargets.get(entityId);
+      if (!target) continue;
+      const c = sprite.position;
+      const dx = target.x - c.x;
+      const dz = target.z - c.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist > 0.05) {
+        const step = Math.min(4.0 * dt, dist);
+        const nx = c.x + (dx / dist) * step;
+        const nz = c.z + (dz / dist) * step;
+        sprite.position = new Vector3(nx, getInterpolatedHeight(nx, nz), nz);
+      }
+    }
+
+    // Interpolate NPCs
+    for (const [entityId, sprite] of this.npcSprites) {
+      const target = this.npcTargets.get(entityId);
+      if (!target) continue;
+      const c = sprite.position;
+      const dx = target.x - c.x;
+      const dz = target.z - c.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist > 0.05) {
+        const step = Math.min(3.0 * dt, dist);
+        const nx = c.x + (dx / dist) * step;
+        const nz = c.z + (dz / dist) * step;
+        sprite.position = new Vector3(nx, getInterpolatedHeight(nx, nz), nz);
+      }
+    }
+
+    // Update hit splats (screen-space projection)
+    {
+      const cam = this.scene.activeCamera;
+      if (cam) {
+        const w = this.engine.getRenderWidth();
+        const h = this.engine.getRenderHeight();
+        const viewMatrix = cam.getViewMatrix();
+        const projMatrix = cam.getProjectionMatrix();
+        const transform = viewMatrix.multiply(projMatrix);
+        const vp = new Viewport(0, 0, w, h);
+
+        for (let i = this.hitSplats.length - 1; i >= 0; i--) {
+          const splat = this.hitSplats[i];
+          splat.timer -= dt;
+          splat.worldPos.y += dt * 0.5; // drift upward in world space
+
+          // Fade out in last 0.3s
+          const opacity = splat.timer < 0.3 ? splat.timer / 0.3 : 1;
+          splat.el.style.opacity = opacity.toString();
+
+          if (splat.timer <= 0) {
+            splat.el.remove();
+            this.hitSplats.splice(i, 1);
+          } else {
+            const screenPos = Vector3.Project(splat.worldPos, Matrix.Identity(), transform, vp);
+            splat.el.style.left = `${screenPos.x}px`;
+            splat.el.style.top = `${screenPos.y}px`;
+          }
+        }
+      }
+    }
+
+    // Camera follows player
+    if (this.localPlayer) {
+      this.camera.followTarget(new Vector3(this.playerX, getInterpolatedHeight(this.playerX, this.playerZ), this.playerZ));
+    }
+
+    // Update all HTML overlay positions (chat bubbles, health bars)
+    this.updateOverlayPositions();
+
+    // Update minimap
+    if (this.minimap) {
+      const remotePosArr: { x: number; z: number }[] = [];
+      for (const [, target] of this.remoteTargets) {
+        remotePosArr.push(target);
+      }
+      const npcPosArr: { x: number; z: number }[] = [];
+      for (const [, target] of this.npcTargets) {
+        npcPosArr.push(target);
+      }
+      this.minimap.update(this.playerX, this.playerZ, remotePosArr, npcPosArr);
+    }
+  }
+}

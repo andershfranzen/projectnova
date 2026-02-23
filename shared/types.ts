@@ -28,10 +28,28 @@ export interface ItemDef {
   description: string;
   stackable: boolean;
   equippable: boolean;
-  equipSlot?: 'weapon' | 'head' | 'body' | 'legs' | 'shield' | 'cape' | 'ring';
-  attackBonus?: number;
-  defenceBonus?: number;
-  strengthBonus?: number;
+  equipSlot?: 'weapon' | 'head' | 'body' | 'legs' | 'shield' | 'neck' | 'ring' | 'hands' | 'feet' | 'cape';
+  attackSpeed?: number;
+  weaponStyle?: 'stab' | 'slash' | 'crush';
+  // Attack bonuses
+  stabAttack?: number;
+  slashAttack?: number;
+  crushAttack?: number;
+  // Defence bonuses
+  stabDefence?: number;
+  slashDefence?: number;
+  crushDefence?: number;
+  // Strength
+  meleeStrength?: number;
+  // Ranged
+  rangedAccuracy?: number;
+  rangedStrength?: number;
+  rangedDefence?: number;
+  // Magic
+  magicAccuracy?: number;
+  magicDefence?: number;
+  // Food
+  healAmount?: number;
   value: number;
 }
 

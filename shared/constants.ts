@@ -1,5 +1,5 @@
 export const TICK_RATE = 600; // ms per game tick
-export const MAP_SIZE = 64; // tiles per side
+export const MAP_SIZE = 96; // tiles per side
 export const TILE_SIZE = 1; // world units per tile
 export const MAX_PLAYERS = 256;
 export const MAX_NPCS = 512;
