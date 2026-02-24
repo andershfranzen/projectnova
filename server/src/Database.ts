@@ -15,6 +15,7 @@ export interface SessionInfo {
 export interface SavedPlayerState {
   x: number;
   z: number;
+  mapLevel: string;
   skills: SkillBlock;
   inventory: ({ itemId: number; quantity: number } | null)[];
   equipment: Map<EquipSlot, number>;
@@ -49,8 +50,9 @@ export class GameDatabase {
 
       CREATE TABLE IF NOT EXISTS player_state (
         account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
-        x REAL DEFAULT 48,
-        z REAL DEFAULT 48,
+        x REAL DEFAULT 512.5,
+        z REAL DEFAULT 512.5,
+        map_level TEXT DEFAULT 'overworld',
         skills TEXT DEFAULT '{}',
         inventory TEXT DEFAULT '[]',
         equipment TEXT DEFAULT '{}',
@@ -149,11 +151,13 @@ export class GameDatabase {
     this.db.query(`
       UPDATE player_state SET
         x = ?, z = ?,
+        map_level = ?,
         skills = ?, inventory = ?, equipment = ?,
         stance = ?, updated_at = unixepoch()
       WHERE account_id = ?
     `).run(
       player.position.x, player.position.y,
+      player.currentMapLevel,
       JSON.stringify(skills),
       JSON.stringify(player.inventory),
       JSON.stringify(equipment),
@@ -163,8 +167,8 @@ export class GameDatabase {
   }
 
   loadPlayerState(accountId: number): SavedPlayerState | null {
-    const row = this.db.query('SELECT x, z, skills, inventory, equipment, stance FROM player_state WHERE account_id = ?')
-      .get(accountId) as { x: number; z: number; skills: string; inventory: string; equipment: string; stance: string } | null;
+    const row = this.db.query('SELECT x, z, map_level, skills, inventory, equipment, stance FROM player_state WHERE account_id = ?')
+      .get(accountId) as { x: number; z: number; map_level: string; skills: string; inventory: string; equipment: string; stance: string } | null;
 
     if (!row) return null;
 
@@ -211,6 +215,7 @@ export class GameDatabase {
     return {
       x: row.x,
       z: row.z,
+      mapLevel: row.map_level || 'overworld',
       skills,
       inventory,
       equipment,

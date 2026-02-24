@@ -94,3 +94,108 @@ export enum TileType {
 }
 
 export const BLOCKING_TILES = new Set([TileType.WATER, TileType.WALL]);
+
+// --- World object definition ---
+
+export interface WorldObjectDef {
+  id: number;
+  name: string;
+  category: 'tree' | 'rock' | 'fishingspot' | 'furnace' | 'cookingrange' | 'anvil' | 'altar' | 'door' | 'chest' | 'scenery';
+  actions: string[]; // e.g. ["Chop", "Examine"]
+  blocking: boolean;
+  width: number;
+  height: number;
+  color: [number, number, number]; // RGB 0-255 for client sprite
+
+  // Harvesting (trees, rocks, fishing)
+  skill?: string; // SkillId
+  levelRequired?: number;
+  xpReward?: number;
+  harvestItemId?: number;
+  harvestQuantity?: number;
+  harvestTime?: number; // ticks to harvest
+  depletionChance?: number; // 0-1, chance per success
+  respawnTime?: number; // ticks after depletion
+
+  // Crafting station recipes (furnace, cooking range)
+  recipes?: ObjectRecipe[];
+}
+
+export interface ObjectRecipe {
+  inputItemId: number;
+  inputQuantity: number;
+  outputItemId: number;
+  outputQuantity: number;
+  skill: string; // SkillId
+  levelRequired: number;
+  xpReward: number;
+}
+
+// --- Map metadata types ---
+
+export interface MapTransition {
+  tileX: number;
+  tileZ: number;
+  targetMap: string;
+  targetX: number;
+  targetZ: number;
+}
+
+export interface MapMeta {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  heightRange: [number, number];
+  waterLevel: number;
+  spawnPoint: { x: number; z: number };
+  fogColor: [number, number, number];
+  fogStart: number;
+  fogEnd: number;
+  transitions: MapTransition[];
+}
+
+export interface SpawnEntry {
+  npcId: number;
+  x: number;
+  z: number;
+}
+
+export interface ObjectSpawnEntry {
+  objectId: number;
+  x: number;
+  z: number;
+}
+
+export interface SpawnsFile {
+  npcs: SpawnEntry[];
+  objects?: ObjectSpawnEntry[];
+}
+
+// Color-to-TileType mapping for tilemap PNG decoding
+export const TILEMAP_COLORS: { r: number; g: number; b: number; type: TileType }[] = [
+  { r: 0x4a, g: 0x8a, b: 0x30, type: TileType.GRASS },
+  { r: 0x8c, g: 0x68, b: 0x40, type: TileType.DIRT },
+  { r: 0x80, g: 0x80, b: 0x80, type: TileType.STONE },
+  { r: 0x30, g: 0x60, b: 0xb0, type: TileType.WATER },
+  { r: 0x50, g: 0x40, b: 0x40, type: TileType.WALL },
+  { r: 0xc0, g: 0xb0, b: 0x80, type: TileType.SAND },
+  { r: 0x70, g: 0x50, b: 0x28, type: TileType.WOOD },
+];
+
+/** Find closest TileType from RGB color */
+export function tileTypeFromRgb(r: number, g: number, b: number): TileType {
+  let best = TileType.GRASS;
+  let bestDist = Infinity;
+  for (const entry of TILEMAP_COLORS) {
+    const dr = r - entry.r;
+    const dg = g - entry.g;
+    const db = b - entry.b;
+    const dist = dr * dr + dg * dg + db * db;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = entry.type;
+    }
+  }
+  return best;
+}

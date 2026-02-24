@@ -17,6 +17,7 @@ import {
 } from './network/ChatSocket';
 
 const CLIENT_DIST = resolve(import.meta.dir, '../../client/dist');
+const MAPS_DIR = resolve(import.meta.dir, '../data/maps');
 
 // MIME type lookup
 const MIME_TYPES: Record<string, string> = {
@@ -144,6 +145,45 @@ const server = Bun.serve<SocketData>({
       });
       if (upgraded) return undefined as unknown as Response;
       return new Response('WebSocket upgrade failed', { status: 400 });
+    }
+
+    // --- Data Assets ---
+
+    if (url.pathname === '/data/objects.json') {
+      const filePath = resolve(import.meta.dir, '../data/objects.json');
+      try {
+        const content = readFileSync(filePath);
+        return new Response(content, {
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache',
+          },
+        });
+      } catch {
+        return new Response('Not Found', { status: 404 });
+      }
+    }
+
+    // --- Map Assets ---
+
+    if (url.pathname.startsWith('/maps/')) {
+      const mapPath = url.pathname.slice(6); // remove '/maps/'
+      const filePath = resolve(MAPS_DIR, mapPath);
+      // Prevent directory traversal
+      if (!filePath.startsWith(MAPS_DIR)) {
+        return new Response('Forbidden', { status: 403 });
+      }
+      try {
+        const content = readFileSync(filePath);
+        return new Response(content, {
+          headers: {
+            'Content-Type': getMimeType(filePath),
+            'Cache-Control': 'no-cache',
+          },
+        });
+      } catch {
+        return new Response('Not Found', { status: 404 });
+      }
     }
 
     // --- Static File Serving ---

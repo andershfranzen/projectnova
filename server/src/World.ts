@@ -1,12 +1,15 @@
-import { TICK_RATE, ServerOpcode, ALL_SKILLS, type SkillId, type ItemDef } from '@projectrs/shared';
-import { encodePacket } from '@projectrs/shared';
+import { TICK_RATE, CHUNK_SIZE, CHUNK_LOAD_RADIUS, ServerOpcode, ALL_SKILLS, type SkillId, type ItemDef } from '@projectrs/shared';
+import { encodePacket, encodeStringPacket } from '@projectrs/shared';
+import { addXp, levelFromXp } from '@projectrs/shared';
 import { GameMap } from './GameMap';
 import { Player, type EquipSlot } from './entity/Player';
 import { Npc } from './entity/Npc';
+import { WorldObject } from './entity/WorldObject';
 import { DataLoader } from './data/DataLoader';
 import { GameDatabase } from './Database';
 import { processPlayerCombat, processNpcCombat, rollLoot } from './combat/Combat';
 import { broadcastPlayerInfo } from './network/ChatSocket';
+import { ServerChunkManager } from './ChunkManager';
 
 export interface GroundItem {
   id: number;
@@ -14,18 +17,21 @@ export interface GroundItem {
   quantity: number;
   x: number;
   z: number;
+  mapLevel: string;
   despawnTimer: number;
 }
 
 let nextGroundItemId = 1;
 
 export class World {
-  readonly map: GameMap;
+  readonly maps: Map<string, GameMap> = new Map();
+  readonly chunkManagers: Map<string, ServerChunkManager> = new Map();
   readonly data: DataLoader;
   readonly db: GameDatabase;
   readonly players: Map<number, Player> = new Map();
   readonly npcs: Map<number, Npc> = new Map();
   readonly groundItems: Map<number, GroundItem> = new Map();
+  readonly worldObjects: Map<number, WorldObject> = new Map();
 
   private currentTick: number = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -34,67 +40,77 @@ export class World {
   // Player combat targets (playerId -> npcId)
   private playerCombatTargets: Map<number, number> = new Map();
 
+  // Skilling: player -> { objectId, action, ticksLeft }
+  private skillingActions: Map<number, { objectId: number; action: string; ticksLeft: number }> = new Map();
+
   constructor(db: GameDatabase) {
     this.db = db;
-    this.map = new GameMap();
     this.data = new DataLoader();
+
+    // Load all maps
+    this.loadMap('overworld');
+    this.loadMap('underground');
+
+    // Spawn NPCs and objects from data files
     this.spawnNpcs();
+    this.spawnWorldObjects();
+  }
+
+  private loadMap(mapId: string): void {
+    const gameMap = new GameMap(mapId);
+    this.maps.set(mapId, gameMap);
+    this.chunkManagers.set(mapId, new ServerChunkManager(gameMap.width, gameMap.height));
+  }
+
+  getMap(mapId: string): GameMap {
+    const m = this.maps.get(mapId);
+    if (!m) throw new Error(`Unknown map: ${mapId}`);
+    return m;
+  }
+
+  /** Get the map the player is currently on */
+  getPlayerMap(player: Player): GameMap {
+    return this.getMap(player.currentMapLevel);
   }
 
   private spawnNpcs(): void {
-    // Chickens near the farm
-    const chickenDef = this.data.getNpc(1)!;
-    this.addNpc(new Npc(chickenDef, 55.5, 60.5));
-    this.addNpc(new Npc(chickenDef, 57.5, 62.5));
-    this.addNpc(new Npc(chickenDef, 53.5, 61.5));
+    for (const [mapId, gameMap] of this.maps) {
+      const spawns = this.data.loadSpawns(mapId);
+      for (const spawn of spawns.npcs) {
+        const npcDef = this.data.getNpc(spawn.npcId);
+        if (!npcDef) {
+          console.warn(`Unknown NPC id ${spawn.npcId} in ${mapId}/spawns.json`);
+          continue;
+        }
+        const npc = new Npc(npcDef, spawn.x, spawn.z);
+        npc.currentMapLevel = mapId;
+        this.npcs.set(npc.id, npc);
 
-    // Rats near the stone area
-    const ratDef = this.data.getNpc(2)!;
-    this.addNpc(new Npc(ratDef, 14.5, 14.5));
-    this.addNpc(new Npc(ratDef, 16.5, 12.5));
-    this.addNpc(new Npc(ratDef, 13.5, 16.5));
-
-    // Goblins in the goblin camp
-    const goblinDef = this.data.getNpc(3)!;
-    this.addNpc(new Npc(goblinDef, 20.5, 70.5));
-    this.addNpc(new Npc(goblinDef, 22.5, 72.5));
-    this.addNpc(new Npc(goblinDef, 18.5, 71.5));
-    this.addNpc(new Npc(goblinDef, 21.5, 74.5));
-
-    // Wolves in the forest
-    const wolfDef = this.data.getNpc(4)!;
-    this.addNpc(new Npc(wolfDef, 70.5, 20.5));
-    this.addNpc(new Npc(wolfDef, 73.5, 22.5));
-
-    // Skeletons in the dungeon/dark area
-    const skelDef = this.data.getNpc(5)!;
-    this.addNpc(new Npc(skelDef, 80.5, 80.5));
-    this.addNpc(new Npc(skelDef, 82.5, 78.5));
-    this.addNpc(new Npc(skelDef, 78.5, 82.5));
-
-    // Spiders in the forest
-    const spiderDef = this.data.getNpc(6)!;
-    this.addNpc(new Npc(spiderDef, 68.5, 25.5));
-    this.addNpc(new Npc(spiderDef, 72.5, 28.5));
-
-    // Guard near the village center
-    const guardDef = this.data.getNpc(7)!;
-    this.addNpc(new Npc(guardDef, 48.5, 48.5));
-    this.addNpc(new Npc(guardDef, 50.5, 46.5));
-
-    // Shopkeeper inside building
-    const shopkeeperDef = this.data.getNpc(8)!;
-    this.addNpc(new Npc(shopkeeperDef, 42.5, 52.5));
-
-    // Dark Knight boss
-    const dkDef = this.data.getNpc(9)!;
-    this.addNpc(new Npc(dkDef, 85.5, 85.5));
-
-    console.log(`Spawned ${this.npcs.size} NPCs`);
+        // Register with chunk manager
+        const cm = this.chunkManagers.get(mapId)!;
+        cm.addEntity(npc.id, spawn.x, spawn.z);
+      }
+      console.log(`Spawned NPCs for map '${mapId}'`);
+    }
+    console.log(`Total NPCs: ${this.npcs.size}`);
   }
 
-  private addNpc(npc: Npc): void {
-    this.npcs.set(npc.id, npc);
+  private spawnWorldObjects(): void {
+    for (const [mapId] of this.maps) {
+      const spawns = this.data.loadSpawns(mapId);
+      if (!spawns.objects) continue;
+      for (const spawn of spawns.objects) {
+        const objDef = this.data.getObject(spawn.objectId);
+        if (!objDef) {
+          console.warn(`Unknown object id ${spawn.objectId} in ${mapId}/spawns.json`);
+          continue;
+        }
+        const obj = new WorldObject(objDef, spawn.x, spawn.z, mapId);
+        this.worldObjects.set(obj.id, obj);
+      }
+      console.log(`Spawned objects for map '${mapId}'`);
+    }
+    console.log(`Total world objects: ${this.worldObjects.size}`);
   }
 
   start(): void {
@@ -113,7 +129,6 @@ export class World {
       clearInterval(this.saveTimer);
       this.saveTimer = null;
     }
-    // Final save on shutdown
     this.saveAllPlayers();
   }
 
@@ -137,7 +152,13 @@ export class World {
 
   addPlayer(player: Player): void {
     this.players.set(player.id, player);
-    console.log(`Player "${player.name}" (id=${player.id}) joined`);
+    console.log(`Player "${player.name}" (id=${player.id}) joined on ${player.currentMapLevel}`);
+
+    // Register with chunk manager
+    const cm = this.chunkManagers.get(player.currentMapLevel)!;
+    cm.addEntity(player.id, player.position.x, player.position.y);
+    player.currentChunkX = Math.floor(player.position.x / CHUNK_SIZE);
+    player.currentChunkZ = Math.floor(player.position.y / CHUNK_SIZE);
 
     // Send login confirmation
     this.sendToPlayer(player, ServerOpcode.LOGIN_OK, player.id,
@@ -145,66 +166,108 @@ export class World {
       Math.round(player.position.y * 10)
     );
 
-    // Broadcast player name to all chat sockets (so clients can map entityId → name)
+    // Broadcast player name to all chat sockets
     broadcastPlayerInfo(player.id, player.name);
-    // Also send all existing player names to the new player
     for (const [, other] of this.players) {
       if (other.id !== player.id) {
         broadcastPlayerInfo(other.id, other.name);
       }
     }
 
-    // Send existing players
+    // Send nearby existing players
     for (const [, other] of this.players) {
-      if (other.id !== player.id) {
-        this.sendPlayerUpdate(player, other);
-        this.sendPlayerUpdate(other, player);
+      if (other.id !== player.id && other.currentMapLevel === player.currentMapLevel) {
+        if (this.isNearby(player, other.position.x, other.position.y)) {
+          this.sendPlayerUpdate(player, other);
+        }
+        if (this.isNearby(other, player.position.x, player.position.y)) {
+          this.sendPlayerUpdate(other, player);
+        }
       }
     }
 
-    // Send existing NPCs
+    // Send nearby NPCs
     for (const [, npc] of this.npcs) {
-      if (!npc.dead) {
+      if (!npc.dead && npc.currentMapLevel === player.currentMapLevel &&
+          this.isNearby(player, npc.position.x, npc.position.y)) {
         this.sendNpcUpdate(player, npc);
       }
     }
 
-    // Send existing ground items
+    // Send nearby ground items
     for (const [, item] of this.groundItems) {
-      this.sendGroundItemUpdate(player, item);
+      if (item.mapLevel === player.currentMapLevel &&
+          this.isNearby(player, item.x, item.z)) {
+        this.sendGroundItemUpdate(player, item);
+      }
+    }
+
+    // Send nearby world objects
+    for (const [, obj] of this.worldObjects) {
+      if (obj.mapLevel === player.currentMapLevel &&
+          this.isNearby(player, obj.x, obj.z)) {
+        this.sendWorldObjectUpdate(player, obj);
+      }
     }
 
     // Send full skills
     this.sendSkills(player);
-    // Send inventory
     this.sendInventory(player);
-    // Send equipment
     this.sendEquipment(player);
+  }
+
+  private cancelSkilling(playerId: number): void {
+    if (this.skillingActions.has(playerId)) {
+      this.skillingActions.delete(playerId);
+      const player = this.players.get(playerId);
+      if (player) {
+        this.sendToPlayer(player, ServerOpcode.SKILLING_STOP, 0);
+      }
+    }
   }
 
   removePlayer(playerId: number): void {
     const player = this.players.get(playerId);
     if (!player) return;
+
+    // Remove from chunk manager
+    const cm = this.chunkManagers.get(player.currentMapLevel);
+    if (cm) cm.removeEntity(player.id);
+
     this.players.delete(playerId);
     this.playerCombatTargets.delete(playerId);
+    this.skillingActions.delete(playerId);
     console.log(`Player "${player.name}" left`);
 
+    // Notify nearby players
     for (const [, other] of this.players) {
-      this.sendToPlayer(other, ServerOpcode.ENTITY_DEATH, playerId);
+      if (other.currentMapLevel === player.currentMapLevel &&
+          this.isNearby(other, player.position.x, player.position.y)) {
+        this.sendToPlayer(other, ServerOpcode.ENTITY_DEATH, playerId);
+      }
     }
+  }
+
+  /** Check if a world position is within chunk load radius of a player */
+  private isNearby(player: Player, worldX: number, worldZ: number): boolean {
+    const cx = Math.floor(worldX / CHUNK_SIZE);
+    const cz = Math.floor(worldZ / CHUNK_SIZE);
+    return Math.abs(cx - player.currentChunkX) <= CHUNK_LOAD_RADIUS &&
+           Math.abs(cz - player.currentChunkZ) <= CHUNK_LOAD_RADIUS;
   }
 
   handlePlayerMove(playerId: number, path: { x: number; z: number }[]): void {
     const player = this.players.get(playerId);
     if (!player) return;
 
-    // Cancel combat when moving
     this.playerCombatTargets.delete(playerId);
     player.attackTarget = null;
+    this.cancelSkilling(playerId);
 
+    const map = this.getPlayerMap(player);
     const validPath: { x: number; z: number }[] = [];
     for (const step of path) {
-      if (!this.map.isBlocked(step.x, step.z)) {
+      if (!map.isBlocked(step.x, step.z)) {
         validPath.push(step);
       } else {
         break;
@@ -217,16 +280,18 @@ export class World {
     const player = this.players.get(playerId);
     const npc = this.npcs.get(npcId);
     if (!player || !npc || npc.dead) return;
+    this.cancelSkilling(playerId);
+    if (npc.currentMapLevel !== player.currentMapLevel) return;
 
     player.attackTarget = npc;
     this.playerCombatTargets.set(playerId, npcId);
 
-    // Walk to NPC if not adjacent
     const dx = npc.position.x - player.position.x;
     const dz = npc.position.y - player.position.y;
     const dist = Math.sqrt(dx * dx + dz * dz);
     if (dist > 1.5) {
-      const path = this.map.findPath(player.position.x, player.position.y, npc.position.x, npc.position.y);
+      const map = this.getPlayerMap(player);
+      const path = map.findPath(player.position.x, player.position.y, npc.position.x, npc.position.y);
       if (path.length > 1) {
         player.moveQueue = path.slice(0, -1);
       } else {
@@ -241,6 +306,7 @@ export class World {
     const player = this.players.get(playerId);
     const item = this.groundItems.get(groundItemId);
     if (!player || !item) return;
+    if (item.mapLevel !== player.currentMapLevel) return;
 
     const dx = Math.abs(player.position.x - item.x);
     const dz = Math.abs(player.position.y - item.z);
@@ -248,10 +314,11 @@ export class World {
 
     if (player.addItem(item.itemId, item.quantity)) {
       this.groundItems.delete(groundItemId);
+      // Notify nearby players
       for (const [, p] of this.players) {
-        this.sendToPlayer(p, ServerOpcode.GROUND_ITEM_SYNC,
-          groundItemId, 0, 0, 0, 0
-        );
+        if (p.currentMapLevel === item.mapLevel && this.isNearby(p, item.x, item.z)) {
+          this.sendToPlayer(p, ServerOpcode.GROUND_ITEM_SYNC, groundItemId, 0, 0, 0, 0);
+        }
       }
       this.sendInventory(player);
     }
@@ -270,14 +337,120 @@ export class World {
       quantity: removed.quantity,
       x: player.position.x,
       z: player.position.y,
+      mapLevel: player.currentMapLevel,
       despawnTimer: 200,
     };
     this.groundItems.set(groundItem.id, groundItem);
 
     for (const [, p] of this.players) {
-      this.sendGroundItemUpdate(p, groundItem);
+      if (p.currentMapLevel === groundItem.mapLevel && this.isNearby(p, groundItem.x, groundItem.z)) {
+        this.sendGroundItemUpdate(p, groundItem);
+      }
     }
     this.sendInventory(player);
+  }
+
+  handlePlayerInteractObject(playerId: number, objectEntityId: number, actionIndex: number): void {
+    const player = this.players.get(playerId);
+    const obj = this.worldObjects.get(objectEntityId);
+    if (!player || !obj) return;
+    if (obj.mapLevel !== player.currentMapLevel) return;
+    if (obj.depleted) return;
+
+    // Check distance — must be adjacent
+    const dx = Math.abs(player.position.x - obj.x);
+    const dz = Math.abs(player.position.y - obj.z);
+    if (dx > 2.0 || dz > 2.0) {
+      // Walk toward the object first
+      const map = this.getPlayerMap(player);
+      const path = map.findPath(player.position.x, player.position.y, obj.x, obj.z);
+      if (path.length > 1) {
+        // Remove last step if it's on the object's tile
+        const last = path[path.length - 1];
+        if (Math.floor(last.x) === Math.floor(obj.x) && Math.floor(last.z) === Math.floor(obj.z)) {
+          path.pop();
+        }
+      }
+      player.moveQueue = path;
+      // Queue the interaction for when player arrives
+      return;
+    }
+
+    // Stop movement
+    player.moveQueue = [];
+    player.attackTarget = null;
+    this.playerCombatTargets.delete(playerId);
+
+    const action = obj.def.actions[actionIndex];
+    if (!action) return;
+
+    if (action === 'Examine') {
+      // Just send a chat message
+      this.sendToPlayer(player, ServerOpcode.CHAT_SYSTEM, 0); // Will use chat socket instead
+      return;
+    }
+
+    // Harvesting actions (Chop, Mine, Fish)
+    if (obj.def.skill && obj.def.harvestItemId) {
+      const skillId = obj.def.skill as SkillId;
+      const playerLevel = player.skills[skillId]?.level ?? 1;
+      if (playerLevel < (obj.def.levelRequired ?? 1)) {
+        // Send level requirement message via chat
+        return;
+      }
+
+      // Start skilling action
+      this.skillingActions.set(playerId, {
+        objectId: obj.id,
+        action,
+        ticksLeft: obj.def.harvestTime ?? 4,
+      });
+
+      // Notify client of skilling start
+      this.sendToPlayer(player, ServerOpcode.SKILLING_START, obj.id);
+      return;
+    }
+
+    // Crafting station actions (Smelt, Cook)
+    if (obj.def.recipes && obj.def.recipes.length > 0) {
+      // Find first valid recipe in player's inventory
+      for (const recipe of obj.def.recipes) {
+        const skillId = recipe.skill as SkillId;
+        const playerLevel = player.skills[skillId]?.level ?? 1;
+        if (playerLevel < recipe.levelRequired) continue;
+
+        // Check if player has the input item
+        let inputSlot = -1;
+        for (let i = 0; i < player.inventory.length; i++) {
+          const slot = player.inventory[i];
+          if (slot && slot.itemId === recipe.inputItemId && slot.quantity >= recipe.inputQuantity) {
+            inputSlot = i;
+            break;
+          }
+        }
+        if (inputSlot < 0) continue;
+
+        // Consume input, give output
+        player.removeItem(inputSlot, recipe.inputQuantity);
+        player.addItem(recipe.outputItemId, recipe.outputQuantity);
+
+        // Award XP
+        const result = addXp(player.skills, skillId, recipe.xpReward);
+        const skillIdx = ALL_SKILLS.indexOf(skillId);
+        if (skillIdx >= 0) {
+          this.sendToPlayer(player, ServerOpcode.XP_GAIN, skillIdx, recipe.xpReward);
+          if (result.leveled) {
+            this.sendToPlayer(player, ServerOpcode.LEVEL_UP, skillIdx, result.newLevel);
+          }
+        }
+
+        this.sendInventory(player);
+        this.sendSkills(player);
+        return;
+      }
+      // No valid recipe found - player doesn't have required items/level
+      return;
+    }
   }
 
   handlePlayerEquip(playerId: number, slotIndex: number): void {
@@ -292,16 +465,13 @@ export class World {
 
     const equipSlot = itemDef.equipSlot as EquipSlot;
 
-    // Unequip current item in that slot (swap to inventory)
     const currentEquipped = player.equipment.get(equipSlot);
     if (currentEquipped !== undefined) {
-      // Try to put old item in the same inventory slot
       player.inventory[slotIndex] = { itemId: currentEquipped, quantity: 1 };
     } else {
       player.removeItem(slotIndex);
     }
 
-    // Equip new item
     player.equipment.set(equipSlot, slot.itemId);
 
     this.sendInventory(player);
@@ -319,7 +489,6 @@ export class World {
     const itemId = player.equipment.get(slotName);
     if (itemId === undefined) return;
 
-    // Try to add to inventory
     if (player.addItem(itemId, 1)) {
       player.equipment.delete(slotName);
       this.sendInventory(player);
@@ -337,7 +506,6 @@ export class World {
     const itemDef = this.data.getItem(slot.itemId);
     if (!itemDef || !itemDef.healAmount) return;
 
-    // Can't eat at full health
     if (player.health >= player.maxHealth) return;
 
     player.heal(itemDef.healAmount);
@@ -363,25 +531,32 @@ export class World {
   private tick(): void {
     this.currentTick++;
 
-    // Process player movement
+    // Process player movement + update chunk tracking
     for (const [, player] of this.players) {
       player.processMovement();
+      this.updateEntityChunk(player);
     }
 
     // Process NPC AI
     for (const [, npc] of this.npcs) {
       if (npc.dead) {
         if (npc.tickRespawn()) {
+          // Respawned — notify nearby players
           for (const [, p] of this.players) {
-            this.sendNpcUpdate(p, npc);
+            if (p.currentMapLevel === npc.currentMapLevel && this.isNearby(p, npc.position.x, npc.position.y)) {
+              this.sendNpcUpdate(p, npc);
+            }
           }
         }
         continue;
       }
 
+      const map = this.getMap(npc.currentMapLevel);
+
       // Aggressive NPC targeting
       if (npc.def.aggressive && !npc.combatTarget) {
         for (const [, player] of this.players) {
+          if (player.currentMapLevel !== npc.currentMapLevel) continue;
           const dx = Math.abs(npc.position.x - player.position.x);
           const dz = Math.abs(npc.position.y - player.position.y);
           if (dx <= 5 && dz <= 5) {
@@ -391,22 +566,26 @@ export class World {
         }
       }
 
-      npc.processAI((x, z) => this.map.isBlocked(x, z));
+      npc.processAI((x, z) => map.isBlocked(x, z));
+
+      // Update NPC chunk position
+      const cm = this.chunkManagers.get(npc.currentMapLevel);
+      if (cm) cm.updateEntity(npc.id, npc.position.x, npc.position.y);
     }
 
-    // Process combat — chase phase: players walk toward their melee target
+    // Process combat — chase phase
     const itemDefs = this.data.itemDefs;
 
     for (const [playerId, npcId] of this.playerCombatTargets) {
       const player = this.players.get(playerId);
       const npc = this.npcs.get(npcId);
-      if (!player || !npc || npc.dead) {
+      if (!player || !npc || npc.dead || npc.currentMapLevel !== player.currentMapLevel) {
         this.playerCombatTargets.delete(playerId);
         continue;
       }
 
-      // If player is too far, walk toward NPC (but stop adjacent, not on top)
-      // Snap player to tile center first to prevent drifting between tiles
+      const map = this.getPlayerMap(player);
+
       player.position.x = Math.floor(player.position.x) + 0.5;
       player.position.y = Math.floor(player.position.y) + 0.5;
       const cdx = npc.position.x - player.position.x;
@@ -418,26 +597,24 @@ export class World {
         const sz = cdz !== 0 ? Math.sign(cdz) : 0;
         const nx = player.position.x + sx;
         const nz = player.position.y + sz;
-        // Don't step onto the NPC's tile
         const npcTileX = Math.floor(npc.position.x);
         const npcTileZ = Math.floor(npc.position.y);
         const wouldOverlap = (px: number, pz: number) =>
           Math.floor(px) === npcTileX && Math.floor(pz) === npcTileZ;
-        if (sx !== 0 && sz !== 0 && !this.map.isBlocked(nx, nz) && !wouldOverlap(nx, nz)) {
+        if (sx !== 0 && sz !== 0 && !map.isBlocked(nx, nz) && !wouldOverlap(nx, nz)) {
           player.position.x = nx;
           player.position.y = nz;
-        } else if (sx !== 0 && !this.map.isBlocked(player.position.x + sx, player.position.y) && !wouldOverlap(player.position.x + sx, player.position.y)) {
+        } else if (sx !== 0 && !map.isBlocked(player.position.x + sx, player.position.y) && !wouldOverlap(player.position.x + sx, player.position.y)) {
           player.position.x += sx;
-        } else if (sz !== 0 && !this.map.isBlocked(player.position.x, player.position.y + sz) && !wouldOverlap(player.position.x, player.position.y + sz)) {
+        } else if (sz !== 0 && !map.isBlocked(player.position.x, player.position.y + sz) && !wouldOverlap(player.position.x, player.position.y + sz)) {
           player.position.y += sz;
         }
       }
 
       const result = processPlayerCombat(player, npc, itemDefs);
       if (result) {
-        this.broadcastCombatHit(result.hit.attackerId, result.hit.targetId, result.hit.damage, result.hit.targetHealth, result.hit.targetMaxHealth);
+        this.broadcastCombatHit(result.hit.attackerId, result.hit.targetId, result.hit.damage, result.hit.targetHealth, result.hit.targetMaxHealth, player.currentMapLevel, npc.position.x, npc.position.y);
 
-        // Send XP drops
         for (const xp of result.xpDrops) {
           const skillIdx = ALL_SKILLS.indexOf(xp.skill as SkillId);
           if (skillIdx >= 0) {
@@ -445,7 +622,6 @@ export class World {
           }
         }
 
-        // Send level ups
         for (const lu of result.levelUps) {
           const skillIdx = ALL_SKILLS.indexOf(lu.skill as SkillId);
           if (skillIdx >= 0) {
@@ -453,7 +629,6 @@ export class World {
           }
         }
 
-        // Send updated skills
         if (result.xpDrops.length > 0) {
           this.sendSkills(player);
         }
@@ -462,8 +637,11 @@ export class World {
           npc.die();
           this.playerCombatTargets.delete(playerId);
 
+          // Notify nearby players of NPC death
           for (const [, p] of this.players) {
-            this.sendToPlayer(p, ServerOpcode.ENTITY_DEATH, npc.id);
+            if (p.currentMapLevel === npc.currentMapLevel && this.isNearby(p, npc.position.x, npc.position.y)) {
+              this.sendToPlayer(p, ServerOpcode.ENTITY_DEATH, npc.id);
+            }
           }
 
           // Drop loot
@@ -475,11 +653,14 @@ export class World {
               quantity: drop.quantity,
               x: npc.spawnX,
               z: npc.spawnZ,
+              mapLevel: npc.currentMapLevel,
               despawnTimer: 200,
             };
             this.groundItems.set(groundItem.id, groundItem);
             for (const [, p] of this.players) {
-              this.sendGroundItemUpdate(p, groundItem);
+              if (p.currentMapLevel === groundItem.mapLevel && this.isNearby(p, groundItem.x, groundItem.z)) {
+                this.sendGroundItemUpdate(p, groundItem);
+              }
             }
           }
         }
@@ -490,24 +671,23 @@ export class World {
     for (const [, npc] of this.npcs) {
       if (npc.dead || !npc.combatTarget) continue;
       const target = npc.combatTarget as Player;
-      if (!target.alive || !this.players.has(target.id)) {
+      if (!target.alive || !this.players.has(target.id) || target.currentMapLevel !== npc.currentMapLevel) {
         npc.combatTarget = null;
         continue;
       }
 
       const hit = processNpcCombat(npc, target, itemDefs);
       if (hit) {
-        this.broadcastCombatHit(hit.attackerId, hit.targetId, hit.damage, hit.targetHealth, hit.targetMaxHealth);
+        this.broadcastCombatHit(hit.attackerId, hit.targetId, hit.damage, hit.targetHealth, hit.targetMaxHealth, npc.currentMapLevel, target.position.x, target.position.y);
 
-        // Send updated stats
         this.sendToPlayer(target, ServerOpcode.PLAYER_STATS,
           target.health, target.maxHealth
         );
         this.sendSkills(target);
 
         if (!target.alive) {
-          // Player died — respawn at spawn point
-          const spawn = this.map.findSpawnPoint();
+          const map = this.getMap(target.currentMapLevel);
+          const spawn = map.findSpawnPoint();
           target.health = target.maxHealth;
           target.skills.hitpoints.currentLevel = target.maxHealth;
           target.position.x = spawn.x;
@@ -525,13 +705,11 @@ export class World {
       }
     }
 
-    // NPC health regeneration: 1 HP every 10 ticks (~6s) when out of combat
+    // NPC health regeneration
     if (this.currentTick % 10 === 0) {
       for (const [, npc] of this.npcs) {
         if (npc.dead || npc.health >= npc.maxHealth) continue;
-        // Skip if NPC is in combat (aggressive NPC targeting a player)
         if (npc.combatTarget) continue;
-        // Skip if any player is attacking this NPC
         let inCombat = false;
         for (const [, npcId] of this.playerCombatTargets) {
           if (npcId === npc.id) { inCombat = true; break; }
@@ -540,12 +718,10 @@ export class World {
         npc.heal(1);
       }
 
-      // Player health regeneration: same rate, out of combat only
+      // Player health regeneration
       for (const [playerId, player] of this.players) {
         if (!player.alive || player.health >= player.maxHealth) continue;
-        // Skip if player is attacking an NPC
         if (this.playerCombatTargets.has(playerId)) continue;
-        // Skip if any NPC is targeting this player
         let inCombat = false;
         for (const [, npc] of this.npcs) {
           if (npc.combatTarget === player) { inCombat = true; break; }
@@ -558,40 +734,241 @@ export class World {
       }
     }
 
+    // Process skilling actions
+    for (const [playerId, action] of this.skillingActions) {
+      const player = this.players.get(playerId);
+      if (!player) {
+        this.skillingActions.delete(playerId);
+        continue;
+      }
+
+      const obj = this.worldObjects.get(action.objectId);
+      if (!obj || obj.depleted || obj.mapLevel !== player.currentMapLevel) {
+        this.skillingActions.delete(playerId);
+        this.sendToPlayer(player, ServerOpcode.SKILLING_STOP, 0);
+        continue;
+      }
+
+      // Check still adjacent
+      const sdx = Math.abs(player.position.x - obj.x);
+      const sdz = Math.abs(player.position.y - obj.z);
+      if (sdx > 2.0 || sdz > 2.0) {
+        this.skillingActions.delete(playerId);
+        this.sendToPlayer(player, ServerOpcode.SKILLING_STOP, 0);
+        continue;
+      }
+
+      action.ticksLeft--;
+      if (action.ticksLeft <= 0) {
+        // Success! Give item and XP
+        const skillId = obj.def.skill as SkillId;
+        const itemId = obj.def.harvestItemId!;
+        const qty = obj.def.harvestQuantity ?? 1;
+        const xpReward = obj.def.xpReward ?? 0;
+
+        if (player.addItem(itemId, qty)) {
+          // Award XP
+          if (xpReward > 0) {
+            const result = addXp(player.skills, skillId, xpReward);
+            const skillIdx = ALL_SKILLS.indexOf(skillId);
+            if (skillIdx >= 0) {
+              this.sendToPlayer(player, ServerOpcode.XP_GAIN, skillIdx, xpReward);
+              if (result.leveled) {
+                this.sendToPlayer(player, ServerOpcode.LEVEL_UP, skillIdx, result.newLevel);
+              }
+            }
+          }
+
+          this.sendInventory(player);
+          this.sendSkills(player);
+
+          // Roll depletion
+          if (obj.def.depletionChance && Math.random() < obj.def.depletionChance) {
+            obj.deplete();
+            // Notify all nearby players
+            for (const [, p] of this.players) {
+              if (p.currentMapLevel === obj.mapLevel && this.isNearby(p, obj.x, obj.z)) {
+                this.sendToPlayer(p, ServerOpcode.WORLD_OBJECT_DEPLETED, obj.id, 1);
+              }
+            }
+            this.skillingActions.delete(playerId);
+            this.sendToPlayer(player, ServerOpcode.SKILLING_STOP, 0);
+          } else {
+            // Reset timer for next harvest
+            action.ticksLeft = obj.def.harvestTime ?? 4;
+          }
+        } else {
+          // Inventory full
+          this.skillingActions.delete(playerId);
+          this.sendToPlayer(player, ServerOpcode.SKILLING_STOP, 0);
+        }
+      }
+    }
+
+    // Tick world object respawns
+    for (const [, obj] of this.worldObjects) {
+      if (obj.tickRespawn()) {
+        // Respawned — notify nearby players
+        for (const [, p] of this.players) {
+          if (p.currentMapLevel === obj.mapLevel && this.isNearby(p, obj.x, obj.z)) {
+            this.sendToPlayer(p, ServerOpcode.WORLD_OBJECT_DEPLETED, obj.id, 0);
+          }
+        }
+      }
+    }
+
     // Despawn ground items
     for (const [id, item] of this.groundItems) {
       item.despawnTimer--;
       if (item.despawnTimer <= 0) {
         this.groundItems.delete(id);
         for (const [, p] of this.players) {
-          this.sendToPlayer(p, ServerOpcode.GROUND_ITEM_SYNC, id, 0, 0, 0, 0);
+          if (p.currentMapLevel === item.mapLevel && this.isNearby(p, item.x, item.z)) {
+            this.sendToPlayer(p, ServerOpcode.GROUND_ITEM_SYNC, id, 0, 0, 0, 0);
+          }
         }
       }
     }
 
-    // Broadcast positions
+    // Check transitions
+    for (const [, player] of this.players) {
+      const map = this.getPlayerMap(player);
+      const transition = map.getTransitionAt(player.position.x, player.position.y);
+      if (transition) {
+        this.handleMapTransition(player, transition);
+      }
+    }
+
+    // Broadcast positions (chunk-filtered)
     this.broadcastSync();
+  }
+
+  private handleMapTransition(player: Player, transition: { targetMap: string; targetX: number; targetZ: number }): void {
+    const oldMap = player.currentMapLevel;
+    const newMap = transition.targetMap;
+
+    if (!this.maps.has(newMap)) return;
+
+    // Save player state
+    this.db.savePlayerState(player.accountId, player);
+
+    // Remove from old map's chunk manager
+    const oldCm = this.chunkManagers.get(oldMap);
+    if (oldCm) oldCm.removeEntity(player.id);
+
+    // Send ENTITY_DEATH for all entities the player was seeing (clean slate)
+    for (const [, other] of this.players) {
+      if (other.id !== player.id && other.currentMapLevel === oldMap) {
+        this.sendToPlayer(player, ServerOpcode.ENTITY_DEATH, other.id);
+        // Also tell the other player this player disappeared
+        if (this.isNearby(other, player.position.x, player.position.y)) {
+          this.sendToPlayer(other, ServerOpcode.ENTITY_DEATH, player.id);
+        }
+      }
+    }
+    for (const [, npc] of this.npcs) {
+      if (!npc.dead && npc.currentMapLevel === oldMap) {
+        this.sendToPlayer(player, ServerOpcode.ENTITY_DEATH, npc.id);
+      }
+    }
+
+    // Update player state
+    player.currentMapLevel = newMap;
+    player.position.x = transition.targetX;
+    player.position.y = transition.targetZ;
+    player.moveQueue = [];
+    player.attackTarget = null;
+    this.playerCombatTargets.delete(player.id);
+
+    // Update chunk position
+    player.currentChunkX = Math.floor(player.position.x / CHUNK_SIZE);
+    player.currentChunkZ = Math.floor(player.position.y / CHUNK_SIZE);
+
+    // Add to new map's chunk manager
+    const newCm = this.chunkManagers.get(newMap);
+    if (newCm) newCm.addEntity(player.id, player.position.x, player.position.y);
+
+    // Send MAP_CHANGE packet
+    this.sendMapChange(player, newMap);
+
+    // Send nearby entities on new map
+    for (const [, other] of this.players) {
+      if (other.id !== player.id && other.currentMapLevel === newMap && this.isNearby(player, other.position.x, other.position.y)) {
+        this.sendPlayerUpdate(player, other);
+        this.sendPlayerUpdate(other, player);
+      }
+    }
+    for (const [, npc] of this.npcs) {
+      if (!npc.dead && npc.currentMapLevel === newMap && this.isNearby(player, npc.position.x, npc.position.y)) {
+        this.sendNpcUpdate(player, npc);
+      }
+    }
+    for (const [, item] of this.groundItems) {
+      if (item.mapLevel === newMap && this.isNearby(player, item.x, item.z)) {
+        this.sendGroundItemUpdate(player, item);
+      }
+    }
+    for (const [, obj] of this.worldObjects) {
+      if (obj.mapLevel === newMap && this.isNearby(player, obj.x, obj.z)) {
+        this.sendWorldObjectUpdate(player, obj);
+      }
+    }
+
+    console.log(`Player "${player.name}" transitioned from ${oldMap} to ${newMap}`);
+  }
+
+  private updateEntityChunk(player: Player): void {
+    const newCX = Math.floor(player.position.x / CHUNK_SIZE);
+    const newCZ = Math.floor(player.position.y / CHUNK_SIZE);
+
+    if (newCX !== player.currentChunkX || newCZ !== player.currentChunkZ) {
+      player.currentChunkX = newCX;
+      player.currentChunkZ = newCZ;
+
+      const cm = this.chunkManagers.get(player.currentMapLevel);
+      if (cm) cm.updateEntity(player.id, player.position.x, player.position.y);
+    }
   }
 
   private broadcastSync(): void {
     for (const [, viewer] of this.players) {
+      // Sync players on same map within chunk range
       for (const [, subject] of this.players) {
+        if (subject.currentMapLevel !== viewer.currentMapLevel) continue;
+        if (!this.isNearby(viewer, subject.position.x, subject.position.y) && subject.id !== viewer.id) continue;
         this.sendPlayerUpdate(viewer, subject);
       }
+      // Sync NPCs on same map within chunk range
       for (const [, npc] of this.npcs) {
-        if (!npc.dead) {
-          this.sendNpcUpdate(viewer, npc);
-        }
+        if (npc.dead || npc.currentMapLevel !== viewer.currentMapLevel) continue;
+        if (!this.isNearby(viewer, npc.position.x, npc.position.y)) continue;
+        this.sendNpcUpdate(viewer, npc);
+      }
+      // World objects don't move, but we sync them periodically for new players entering chunk range
+      // (Initial sync is done in addPlayer; this handles chunk boundary crossings)
+    }
+  }
+
+  private broadcastCombatHit(attackerId: number, targetId: number, damage: number, targetHp: number, targetMaxHp: number, mapLevel: string, worldX: number, worldZ: number): void {
+    for (const [, p] of this.players) {
+      if (p.currentMapLevel === mapLevel && this.isNearby(p, worldX, worldZ)) {
+        this.sendToPlayer(p, ServerOpcode.COMBAT_HIT,
+          attackerId, targetId, damage, targetHp, targetMaxHp
+        );
       }
     }
   }
 
-  private broadcastCombatHit(attackerId: number, targetId: number, damage: number, targetHp: number, targetMaxHp: number): void {
-    for (const [, p] of this.players) {
-      this.sendToPlayer(p, ServerOpcode.COMBAT_HIT,
-        attackerId, targetId, damage, targetHp, targetMaxHp
-      );
-    }
+  private sendMapChange(player: Player, mapId: string): void {
+    const packet = encodeStringPacket(
+      ServerOpcode.MAP_CHANGE,
+      mapId,
+      Math.round(player.position.x * 10),
+      Math.round(player.position.y * 10)
+    );
+    try {
+      player.ws.sendBinary(packet);
+    } catch { /* connection closed */ }
   }
 
   private sendPlayerUpdate(viewer: Player, subject: Player): void {
@@ -612,6 +989,17 @@ export class World {
       Math.round(npc.position.y * 10),
       npc.health,
       npc.maxHealth
+    );
+  }
+
+  private sendWorldObjectUpdate(viewer: Player, obj: WorldObject): void {
+    // [objectEntityId, objectDefId, x*10, z*10, depleted(0/1)]
+    this.sendToPlayer(viewer, ServerOpcode.WORLD_OBJECT_SYNC,
+      obj.id,
+      obj.defId,
+      Math.round(obj.x * 10),
+      Math.round(obj.z * 10),
+      obj.depleted ? 1 : 0
     );
   }
 
@@ -637,8 +1025,6 @@ export class World {
   }
 
   sendSkills(player: Player): void {
-    // Send all skills: [skillIndex, level, currentLevel, xpHigh, xpLow]
-    // XP is split into high/low 16-bit values since it can exceed 16-bit range
     for (let i = 0; i < ALL_SKILLS.length; i++) {
       const skill = player.skills[ALL_SKILLS[i]];
       const xpHigh = (skill.xp >> 16) & 0xFFFF;
@@ -665,5 +1051,10 @@ export class World {
 
   getPlayer(id: number): Player | undefined {
     return this.players.get(id);
+  }
+
+  /** Convenience: get the 'overworld' map (used by legacy callers) */
+  get map(): GameMap {
+    return this.getMap('overworld');
   }
 }

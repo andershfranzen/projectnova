@@ -1,17 +1,77 @@
-import { MAP_SIZE } from '@projectrs/shared';
-
 interface PathNode {
   x: number;
   z: number;
-  g: number; // cost from start
-  h: number; // heuristic to goal
-  f: number; // g + h
+  g: number;
+  h: number;
+  f: number;
   parent: PathNode | null;
+  heapIdx: number;
+}
+
+/** Binary min-heap for A* open list, keyed by f value */
+class MinHeap {
+  private data: PathNode[] = [];
+
+  get length(): number { return this.data.length; }
+
+  push(node: PathNode): void {
+    node.heapIdx = this.data.length;
+    this.data.push(node);
+    this.bubbleUp(this.data.length - 1);
+  }
+
+  pop(): PathNode {
+    const top = this.data[0];
+    const last = this.data.pop()!;
+    if (this.data.length > 0) {
+      this.data[0] = last;
+      last.heapIdx = 0;
+      this.sinkDown(0);
+    }
+    return top;
+  }
+
+  decreaseKey(node: PathNode): void {
+    this.bubbleUp(node.heapIdx);
+  }
+
+  private bubbleUp(i: number): void {
+    const node = this.data[i];
+    while (i > 0) {
+      const parentIdx = (i - 1) >> 1;
+      const parent = this.data[parentIdx];
+      if (node.f >= parent.f) break;
+      this.data[i] = parent;
+      parent.heapIdx = i;
+      i = parentIdx;
+    }
+    this.data[i] = node;
+    node.heapIdx = i;
+  }
+
+  private sinkDown(i: number): void {
+    const len = this.data.length;
+    const node = this.data[i];
+    while (true) {
+      let smallest = i;
+      const left = 2 * i + 1;
+      const right = 2 * i + 2;
+      if (left < len && this.data[left].f < this.data[smallest].f) smallest = left;
+      if (right < len && this.data[right].f < this.data[smallest].f) smallest = right;
+      if (smallest === i) break;
+      this.data[i] = this.data[smallest];
+      this.data[i].heapIdx = i;
+      i = smallest;
+    }
+    this.data[i] = node;
+    node.heapIdx = i;
+  }
 }
 
 /**
- * A* pathfinding on a 2D tile grid.
+ * A* pathfinding on a 2D tile grid with binary heap.
  * isBlocked(x, z) returns true if tile is impassable.
+ * mapWidth/mapHeight define the map bounds.
  */
 export function findPath(
   startX: number,
@@ -19,7 +79,9 @@ export function findPath(
   goalX: number,
   goalZ: number,
   isBlocked: (x: number, z: number) => boolean,
-  maxSteps: number = 100
+  mapWidth: number = 1024,
+  mapHeight: number = 1024,
+  maxSteps: number = 200
 ): { x: number; z: number }[] {
   const sx = Math.floor(startX);
   const sz = Math.floor(startZ);
@@ -28,7 +90,6 @@ export function findPath(
 
   if (sx === gx && sz === gz) return [];
   if (isBlocked(gx, gz)) {
-    // Try to find closest non-blocked neighbor to goal
     const neighbors = getNeighbors(gx, gz, isBlocked);
     let bestNeighbor: { x: number; z: number } | null = null;
     let bestDist = Infinity;
@@ -42,83 +103,83 @@ export function findPath(
       }
     }
     if (!bestNeighbor) return [];
-    return findPath(startX, startZ, bestNeighbor.x + 0.5, bestNeighbor.z + 0.5, isBlocked, maxSteps);
+    return findPath(startX, startZ, bestNeighbor.x + 0.5, bestNeighbor.z + 0.5, isBlocked, mapWidth, mapHeight, maxSteps);
   }
 
-  const open: PathNode[] = [];
-  const closed = new Set<string>();
+  const open = new MinHeap();
+  const closed = new Set<number>();
+  const openMap = new Map<number, PathNode>();
 
-  const key = (x: number, z: number) => `${x},${z}`;
-  // Chebyshev distance — correct heuristic for 8-directional movement
+  const key = (x: number, z: number) => z * mapWidth + x;
   const heuristic = (x: number, z: number) => {
     const dx = Math.abs(x - gx);
     const dz = Math.abs(z - gz);
     return Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz);
   };
 
-  const startNode: PathNode = { x: sx, z: sz, g: 0, h: heuristic(sx, sz), f: heuristic(sx, sz), parent: null };
+  const startH = heuristic(sx, sz);
+  const startNode: PathNode = { x: sx, z: sz, g: 0, h: startH, f: startH, parent: null, heapIdx: 0 };
   open.push(startNode);
+  openMap.set(key(sx, sz), startNode);
 
   let steps = 0;
   while (open.length > 0 && steps < maxSteps) {
     steps++;
 
-    // Find node with lowest f
-    let bestIdx = 0;
-    for (let i = 1; i < open.length; i++) {
-      if (open[i].f < open[bestIdx].f) bestIdx = i;
-    }
-    const current = open.splice(bestIdx, 1)[0];
+    const current = open.pop();
+    const k = key(current.x, current.z);
+    openMap.delete(k);
 
     if (current.x === gx && current.z === gz) {
-      // Reconstruct path
       const path: { x: number; z: number }[] = [];
       let node: PathNode | null = current;
       while (node && !(node.x === sx && node.z === sz)) {
-        path.unshift({ x: node.x + 0.5, z: node.z + 0.5 }); // center of tile
+        path.unshift({ x: node.x + 0.5, z: node.z + 0.5 });
         node = node.parent;
       }
       return path;
     }
 
-    closed.add(key(current.x, current.z));
+    closed.add(k);
 
     for (const neighbor of getNeighbors(current.x, current.z, isBlocked)) {
-      if (closed.has(key(neighbor.x, neighbor.z))) continue;
-      if (neighbor.x < 0 || neighbor.x >= MAP_SIZE || neighbor.z < 0 || neighbor.z >= MAP_SIZE) continue;
+      const nk = key(neighbor.x, neighbor.z);
+      if (closed.has(nk)) continue;
+      if (neighbor.x < 0 || neighbor.x >= mapWidth || neighbor.z < 0 || neighbor.z >= mapHeight) continue;
       if (isBlocked(neighbor.x, neighbor.z)) continue;
 
       const isDiagonal = neighbor.x !== current.x && neighbor.z !== current.z;
       const g = current.g + (isDiagonal ? 1.414 : 1);
-      const h = heuristic(neighbor.x, neighbor.z);
-      const f = g + h;
 
-      const existing = open.find(n => n.x === neighbor.x && n.z === neighbor.z);
+      const existing = openMap.get(nk);
       if (existing) {
         if (g < existing.g) {
           existing.g = g;
-          existing.f = f;
+          existing.f = g + existing.h;
           existing.parent = current;
+          open.decreaseKey(existing);
         }
         continue;
       }
 
-      open.push({ x: neighbor.x, z: neighbor.z, g, h, f, parent: current });
+      const h = heuristic(neighbor.x, neighbor.z);
+      const node: PathNode = { x: neighbor.x, z: neighbor.z, g, h, f: g + h, parent: current, heapIdx: 0 };
+      open.push(node);
+      openMap.set(nk, node);
     }
   }
 
-  return []; // No path found
+  return [];
 }
 
 function getNeighbors(x: number, z: number, isBlocked: (x: number, z: number) => boolean): { x: number; z: number }[] {
   const neighbors = [
-    { x: x - 1, z },     // west
-    { x: x + 1, z },     // east
-    { x, z: z - 1 },     // south
-    { x, z: z + 1 },     // north
+    { x: x - 1, z },
+    { x: x + 1, z },
+    { x, z: z - 1 },
+    { x, z: z + 1 },
   ];
 
-  // Diagonals — only if both adjacent cardinal tiles are clear (no corner cutting)
   if (!isBlocked(x - 1, z) && !isBlocked(x, z - 1)) neighbors.push({ x: x - 1, z: z - 1 });
   if (!isBlocked(x + 1, z) && !isBlocked(x, z - 1)) neighbors.push({ x: x + 1, z: z - 1 });
   if (!isBlocked(x - 1, z) && !isBlocked(x, z + 1)) neighbors.push({ x: x - 1, z: z + 1 });

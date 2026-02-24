@@ -2,23 +2,23 @@ import { Scene } from '@babylonjs/core/scene';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { PointerEventTypes } from '@babylonjs/core/Events/pointerEvents';
-// Side-effect import required for scene.pick() to work with tree-shaking
 import '@babylonjs/core/Culling/ray';
+import type { ChunkManager } from '../rendering/ChunkManager';
 
 export type GroundClickCallback = (worldX: number, worldZ: number) => void;
 
 /**
  * Handles mouse/keyboard input for the game.
- * Click-to-move: detects clicks on the terrain and reports world coordinates.
+ * Click-to-move: detects clicks on chunk terrain meshes and reports world coordinates.
  */
 export class InputManager {
   private scene: Scene;
-  private groundMesh: Mesh;
+  private chunkManager: ChunkManager;
   private onGroundClick: GroundClickCallback | null = null;
 
-  constructor(scene: Scene, groundMesh: Mesh) {
+  constructor(scene: Scene, chunkManager: ChunkManager) {
     this.scene = scene;
-    this.groundMesh = groundMesh;
+    this.chunkManager = chunkManager;
 
     this.scene.onPointerObservable.add((pointerInfo) => {
       if (pointerInfo.type === PointerEventTypes.POINTERDOWN) {
@@ -28,7 +28,7 @@ export class InputManager {
         const pickResult = this.scene.pick(
           this.scene.pointerX,
           this.scene.pointerY,
-          (mesh) => mesh === this.groundMesh
+          (mesh) => this.chunkManager.isGroundMesh(mesh.name)
         );
 
         if (pickResult?.hit && pickResult.pickedPoint) {

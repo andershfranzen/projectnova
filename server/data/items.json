@@ -46,5 +46,13 @@
     "stabDefence": 6, "slashDefence": 7, "crushDefence": 5, "rangedDefence": 5, "magicDefence": -3, "value": 50 },
   { "id": 22, "name": "Amulet of Power", "description": "A magical amulet.", "stackable": false, "equippable": true,
     "equipSlot": "neck",
-    "stabAttack": 3, "slashAttack": 3, "crushAttack": 3, "meleeStrength": 4, "magicAccuracy": 3, "value": 200 }
+    "stabAttack": 3, "slashAttack": 3, "crushAttack": 3, "meleeStrength": 4, "magicAccuracy": 3, "value": 200 },
+  { "id": 23, "name": "Logs", "description": "A set of logs.", "stackable": false, "equippable": false, "value": 4 },
+  { "id": 24, "name": "Oak Logs", "description": "Logs cut from an oak tree.", "stackable": false, "equippable": false, "value": 10 },
+  { "id": 25, "name": "Copper Ore", "description": "A lump of copper ore.", "stackable": false, "equippable": false, "value": 5 },
+  { "id": 26, "name": "Iron Ore", "description": "A lump of iron ore.", "stackable": false, "equippable": false, "value": 12 },
+  { "id": 27, "name": "Raw Shrimp", "description": "Some raw shrimp.", "stackable": false, "equippable": false, "value": 3 },
+  { "id": 28, "name": "Cooked Shrimp", "description": "Some cooked shrimp. Heals 3 HP.", "stackable": false, "equippable": false, "healAmount": 3, "value": 8 },
+  { "id": 29, "name": "Copper Bar", "description": "A bar of copper.", "stackable": false, "equippable": false, "value": 15 },
+  { "id": 30, "name": "Iron Bar", "description": "A bar of iron.", "stackable": false, "equippable": false, "value": 30 }
 ]

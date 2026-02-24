@@ -13,6 +13,7 @@ export enum ClientOpcode {
   PLAYER_SET_STANCE = 35,
   PLAYER_BUY_ITEM = 36,
   PLAYER_SELL_ITEM = 37,
+  PLAYER_INTERACT_OBJECT = 40,
 }
 
 // Server → Client opcodes
@@ -35,4 +36,9 @@ export enum ServerOpcode {
   CHAT_SYSTEM = 42,
   SHOP_OPEN = 50,
   SHOP_ITEM = 51,
+  WORLD_OBJECT_SYNC = 55,
+  WORLD_OBJECT_DEPLETED = 56,
+  SKILLING_START = 57,
+  SKILLING_STOP = 58,
+  MAP_CHANGE = 60,
 }

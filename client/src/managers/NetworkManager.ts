@@ -17,12 +17,14 @@ export interface PlayerSyncData {
 
 export type MessageHandler = (opcode: ServerOpcode, values: number[]) => void;
 export type ChatHandler = (data: { type: string; from?: string; to?: string; message: string }) => void;
+export type RawMessageHandler = (data: ArrayBuffer) => void;
 
 export class NetworkManager {
   private gameSocket: WebSocket | null = null;
   private chatSocket: WebSocket | null = null;
   private handlers: Map<ServerOpcode, MessageHandler[]> = new Map();
   private chatHandlers: ChatHandler[] = [];
+  private rawHandlers: RawMessageHandler[] = [];
   private connected: boolean = false;
   private localPlayerId: number = -1;
 
@@ -43,6 +45,10 @@ export class NetworkManager {
 
     this.gameSocket.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
+        // Fire raw handlers first (for string packets like MAP_CHANGE)
+        for (const handler of this.rawHandlers) {
+          handler(event.data);
+        }
         const { opcode, values } = decodePacket(event.data);
         this.dispatch(opcode as ServerOpcode, values);
       }
@@ -84,6 +90,10 @@ export class NetworkManager {
 
   onChat(handler: ChatHandler): void {
     this.chatHandlers.push(handler);
+  }
+
+  onRawMessage(handler: RawMessageHandler): void {
+    this.rawHandlers.push(handler);
   }
 
   private dispatch(opcode: ServerOpcode, values: number[]): void {

@@ -17,8 +17,8 @@ export function handleGameSocketOpen(
   // Load saved state or use defaults
   const saved = world.db.loadPlayerState(accountId);
 
-  const spawnX = saved?.x ?? 48;
-  const spawnZ = saved?.z ?? 48;
+  const spawnX = saved?.x ?? 512.5;
+  const spawnZ = saved?.z ?? 512.5;
 
   const player = new Player(username, spawnX, spawnZ, ws, accountId);
 
@@ -28,6 +28,7 @@ export function handleGameSocketOpen(
     player.inventory = saved.inventory;
     player.equipment = saved.equipment;
     player.stance = saved.stance;
+    player.currentMapLevel = saved.mapLevel;
     player.syncHealthFromSkills();
   }
 
@@ -99,6 +100,13 @@ export function handleGameSocketMessage(
     case ClientOpcode.PLAYER_SET_STANCE: {
       const stanceIdx = values[0];
       world.handlePlayerSetStance(playerId, stanceIdx);
+      break;
+    }
+
+    case ClientOpcode.PLAYER_INTERACT_OBJECT: {
+      const objectEntityId = values[0];
+      const actionIndex = values[1] ?? 0;
+      world.handlePlayerInteractObject(playerId, objectEntityId, actionIndex);
       break;
     }
 

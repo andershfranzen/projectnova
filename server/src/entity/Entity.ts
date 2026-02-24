@@ -8,6 +8,7 @@ export abstract class Entity {
   name: string;
   health: number;
   maxHealth: number;
+  currentMapLevel: string = 'overworld';
 
   constructor(name: string, x: number, z: number, maxHealth: number) {
     this.id = nextEntityId++;

@@ -1,205 +1,146 @@
-import { MAP_SIZE, TileType, BLOCKING_TILES, getInterpolatedHeight } from '@projectrs/shared';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
+import { PNG } from 'pngjs';
+import { CHUNK_SIZE, TileType, BLOCKING_TILES, tileTypeFromRgb } from '@projectrs/shared';
+import type { MapMeta, MapTransition } from '@projectrs/shared';
+
+const MAPS_DIR = resolve(import.meta.dir, '../data/maps');
 
 /**
- * Server-side map — same generation as client Terrain.
- * Must stay in sync with client/src/rendering/Terrain.ts generation logic.
+ * Server-side map — loads terrain from heightmap + tilemap PNG files.
  */
 export class GameMap {
-  private tiles: TileType[][];
+  readonly id: string;
+  readonly meta: MapMeta;
+  readonly width: number;
+  readonly height: number;
 
-  constructor() {
-    this.tiles = this.generateMap();
+  /** Height values at vertices (width+1 x height+1) */
+  private heights: Float32Array;
+  /** Tile types (width x height) */
+  private tiles: Uint8Array;
+
+  private minH: number;
+  private maxH: number;
+
+  constructor(mapId: string) {
+    this.id = mapId;
+    const dir = resolve(MAPS_DIR, mapId);
+
+    // Load meta
+    this.meta = JSON.parse(readFileSync(resolve(dir, 'meta.json'), 'utf-8')) as MapMeta;
+    this.width = this.meta.width;
+    this.height = this.meta.height;
+    this.minH = this.meta.heightRange[0];
+    this.maxH = this.meta.heightRange[1];
+    const range = this.maxH - this.minH;
+
+    // Load heightmap
+    const heightPng = PNG.sync.read(readFileSync(resolve(dir, 'heightmap.png')));
+    const vw = this.width + 1;
+    const vh = this.height + 1;
+    if (heightPng.width !== vw || heightPng.height !== vh) {
+      throw new Error(`Heightmap for '${mapId}' must be ${vw}x${vh}, got ${heightPng.width}x${heightPng.height}`);
+    }
+
+    this.heights = new Float32Array(vw * vh);
+    for (let i = 0; i < vw * vh; i++) {
+      // pngjs stores RGBA even for grayscale, pixel value is in R channel
+      const pixel = heightPng.data[i * 4];
+      this.heights[i] = (pixel / 255) * range + this.minH;
+    }
+
+    // Load tilemap
+    const tilePng = PNG.sync.read(readFileSync(resolve(dir, 'tilemap.png')));
+    if (tilePng.width !== this.width || tilePng.height !== this.height) {
+      throw new Error(`Tilemap for '${mapId}' must be ${this.width}x${this.height}, got ${tilePng.width}x${tilePng.height}`);
+    }
+
+    this.tiles = new Uint8Array(this.width * this.height);
+    for (let i = 0; i < this.width * this.height; i++) {
+      const r = tilePng.data[i * 4];
+      const g = tilePng.data[i * 4 + 1];
+      const b = tilePng.data[i * 4 + 2];
+      this.tiles[i] = tileTypeFromRgb(r, g, b);
+    }
+
+    console.log(`Loaded map '${mapId}': ${this.width}x${this.height} tiles, height range [${this.minH}, ${this.maxH}]`);
   }
 
-  private generateMap(): TileType[][] {
-    const tiles: TileType[][] = [];
-
-    for (let x = 0; x < MAP_SIZE; x++) {
-      tiles[x] = [];
-      for (let z = 0; z < MAP_SIZE; z++) {
-        tiles[x][z] = TileType.GRASS;
-      }
-    }
-
-    const cx = Math.floor(MAP_SIZE / 2); // 48
-
-    // === Main dirt roads (cross through center) ===
-    for (let i = 10; i < MAP_SIZE - 10; i++) {
-      tiles[i][cx] = TileType.DIRT;
-      tiles[i][cx - 1] = TileType.DIRT;
-      tiles[cx][i] = TileType.DIRT;
-      tiles[cx - 1][i] = TileType.DIRT;
-    }
-
-    // === Branch road south to goblin area ===
-    for (let z = cx; z < 80; z++) {
-      tiles[20][z] = TileType.DIRT;
-      tiles[21][z] = TileType.DIRT;
-    }
-
-    // === Branch road east to forest ===
-    for (let x = cx; x < 80; x++) {
-      tiles[x][22] = TileType.DIRT;
-      tiles[x][23] = TileType.DIRT;
-    }
-
-    // === Village center area (around 45-55, 45-55) ===
-    // Village square (stone plaza)
-    for (let x = 44; x < 54; x++) {
-      for (let z = 44; z < 54; z++) {
-        tiles[x][z] = TileType.STONE;
-      }
-    }
-
-    // Buildings around village
-    this.placeBuilding(tiles, 40, 50, 6, 5); // Shop
-    this.placeBuilding(tiles, 54, 46, 5, 6); // House 1
-    this.placeBuilding(tiles, 44, 38, 6, 5); // House 2
-    this.placeBuilding(tiles, 38, 44, 5, 5); // House 3
-
-    // === Water pond (lake) ===
-    for (let x = 58; x < 72; x++) {
-      for (let z = 40; z < 54; z++) {
-        const px = x - 65;
-        const pz = z - 47;
-        if (px * px + pz * pz < 35) {
-          tiles[x][z] = TileType.WATER;
-        }
-      }
-    }
-
-    // Sand around lake
-    for (let x = 55; x < 75; x++) {
-      for (let z = 37; z < 57; z++) {
-        if (x >= 0 && x < MAP_SIZE && z >= 0 && z < MAP_SIZE) {
-          const px = x - 65;
-          const pz = z - 47;
-          const d = px * px + pz * pz;
-          if (d >= 35 && d < 60 && tiles[x][z] === TileType.GRASS) {
-            tiles[x][z] = TileType.SAND;
-          }
-        }
-      }
-    }
-
-    // === Farm area (chickens) — east side ===
-    for (let x = 52; x < 62; x++) {
-      for (let z = 58; z < 66; z++) {
-        if (x === 52 || x === 61 || z === 58 || z === 65) {
-          tiles[x][z] = TileType.WOOD; // Fence (walkable)
-        }
-      }
-    }
-
-    // === Stone mine area (NW corner) ===
-    for (let x = 10; x < 20; x++) {
-      for (let z = 10; z < 20; z++) {
-        tiles[x][z] = TileType.STONE;
-      }
-    }
-
-    // === Forest area (NE) — trees are walls ===
-    for (let x = 65; x < 88; x++) {
-      for (let z = 10; z < 35; z++) {
-        // Scattered trees (some blocked)
-        if (Math.sin(x * 3.7 + z * 2.3) > 0.7 && tiles[x][z] === TileType.GRASS) {
-          tiles[x][z] = TileType.WALL; // Tree trunk
-        }
-      }
-    }
-    // Clear paths through forest
-    for (let x = 65; x < 88; x++) {
-      tiles[x][22] = TileType.DIRT;
-      tiles[x][23] = TileType.DIRT;
-    }
-
-    // === Dark area / dungeon (SE corner) ===
-    for (let x = 75; x < 90; x++) {
-      for (let z = 75; z < 90; z++) {
-        tiles[x][z] = TileType.STONE;
-      }
-    }
-    // Walls around dungeon
-    for (let x = 75; x < 90; x++) {
-      if (x !== 82) { // Leave entrance
-        tiles[x][75] = TileType.WALL;
-        tiles[x][89] = TileType.WALL;
-      }
-    }
-    for (let z = 75; z < 90; z++) {
-      tiles[75][z] = TileType.WALL;
-      tiles[89][z] = TileType.WALL;
-    }
-
-    // === Goblin camp (SW area) ===
-    for (let x = 15; x < 28; x++) {
-      for (let z = 68; z < 78; z++) {
-        if (tiles[x][z] === TileType.GRASS) {
-          tiles[x][z] = TileType.DIRT;
-        }
-      }
-    }
-
-    // === Map border walls ===
-    for (let i = 0; i < MAP_SIZE; i++) {
-      tiles[0][i] = TileType.WALL;
-      tiles[MAP_SIZE - 1][i] = TileType.WALL;
-      tiles[i][0] = TileType.WALL;
-      tiles[i][MAP_SIZE - 1] = TileType.WALL;
-    }
-
-    return tiles;
+  /** Get height at a vertex coordinate */
+  getVertexHeight(vx: number, vz: number): number {
+    const vw = this.width + 1;
+    if (vx < 0 || vx >= vw || vz < 0 || vz >= this.height + 1) return 0;
+    return this.heights[vz * vw + vx];
   }
 
-  private placeBuilding(tiles: TileType[][], bx: number, bz: number, w: number, h: number): void {
-    for (let x = bx; x < bx + w && x < MAP_SIZE; x++) {
-      for (let z = bz; z < bz + h && z < MAP_SIZE; z++) {
-        if (x === bx || x === bx + w - 1 || z === bz || z === bz + h - 1) {
-          if (z === bz && x === bx + Math.floor(w / 2)) {
-            tiles[x][z] = TileType.DIRT; // Doorway
-          } else {
-            tiles[x][z] = TileType.WALL;
-          }
-        } else {
-          tiles[x][z] = TileType.WOOD;
-        }
-      }
-    }
+  /** Bilinear interpolation of height at fractional world coordinates */
+  getInterpolatedHeight(x: number, z: number): number {
+    const x0 = Math.floor(x);
+    const z0 = Math.floor(z);
+    const fx = x - x0;
+    const fz = z - z0;
+
+    const h00 = this.getVertexHeight(x0, z0);
+    const h10 = this.getVertexHeight(x0 + 1, z0);
+    const h01 = this.getVertexHeight(x0, z0 + 1);
+    const h11 = this.getVertexHeight(x0 + 1, z0 + 1);
+
+    const h0 = h00 * (1 - fx) + h10 * fx;
+    const h1 = h01 * (1 - fx) + h11 * fx;
+    return h0 * (1 - fz) + h1 * fz;
   }
 
   getHeight(x: number, z: number): number {
-    return getInterpolatedHeight(x, z);
+    return this.getInterpolatedHeight(x, z);
   }
 
   isBlocked(x: number, z: number): boolean {
     const tx = Math.floor(x);
     const tz = Math.floor(z);
-    if (tx < 0 || tx >= MAP_SIZE || tz < 0 || tz >= MAP_SIZE) return true;
-    return BLOCKING_TILES.has(this.tiles[tx][tz]);
+    if (tx < 0 || tx >= this.width || tz < 0 || tz >= this.height) return true;
+    return BLOCKING_TILES.has(this.tiles[tz * this.width + tx] as TileType);
   }
 
   getTileType(x: number, z: number): TileType {
     const tx = Math.floor(x);
     const tz = Math.floor(z);
-    if (tx < 0 || tx >= MAP_SIZE || tz < 0 || tz >= MAP_SIZE) return TileType.WALL;
-    return this.tiles[tx][tz];
+    if (tx < 0 || tx >= this.width || tz < 0 || tz >= this.height) return TileType.WALL;
+    return this.tiles[tz * this.width + tx] as TileType;
   }
 
   findSpawnPoint(): { x: number; z: number } {
-    const cx = Math.floor(MAP_SIZE / 2);
-    const cz = Math.floor(MAP_SIZE / 2);
+    const sp = this.meta.spawnPoint;
+    // Verify spawn point isn't blocked, search nearby if it is
+    if (!this.isBlocked(sp.x, sp.z)) {
+      return { x: sp.x, z: sp.z };
+    }
     for (let r = 0; r < 15; r++) {
       for (let dx = -r; dx <= r; dx++) {
         for (let dz = -r; dz <= r; dz++) {
-          const x = cx + dx;
-          const z = cz + dz;
+          const x = sp.x + dx;
+          const z = sp.z + dz;
           if (!this.isBlocked(x, z)) {
-            return { x: x + 0.5, z: z + 0.5 };
+            return { x: Math.floor(x) + 0.5, z: Math.floor(z) + 0.5 };
           }
         }
       }
     }
-    return { x: cx + 0.5, z: cz + 0.5 };
+    return { x: sp.x, z: sp.z };
+  }
+
+  getTransitions(): MapTransition[] {
+    return this.meta.transitions;
+  }
+
+  /** Check if a position is on a transition tile. Returns the transition or null. */
+  getTransitionAt(x: number, z: number): MapTransition | null {
+    const tx = Math.floor(x);
+    const tz = Math.floor(z);
+    for (const t of this.meta.transitions) {
+      if (t.tileX === tx && t.tileZ === tz) return t;
+    }
+    return null;
   }
 
   findPath(startX: number, startZ: number, goalX: number, goalZ: number): { x: number; z: number }[] {
@@ -211,29 +152,73 @@ export class GameMap {
     if (sx === gx && sz === gz) return [];
     if (this.isBlocked(gx, gz)) return [];
 
-    const open: { x: number; z: number; g: number; f: number; parent: any }[] = [];
-    const closed = new Set<string>();
-    const key = (x: number, z: number) => `${x},${z}`;
-    const h = (x: number, z: number) => {
+    const w = this.width;
+    const h = this.height;
+    const maxSteps = 800;
+
+    // Binary min-heap
+    interface PNode { x: number; z: number; g: number; hv: number; f: number; parent: PNode | null; heapIdx: number }
+    const heap: PNode[] = [];
+    const openMap = new Map<number, PNode>();
+    const closed = new Set<number>();
+    const key = (x: number, z: number) => z * w + x;
+
+    const heuristic = (x: number, z: number) => {
       const dx = Math.abs(x - gx);
       const dz = Math.abs(z - gz);
       return Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz);
     };
 
-    open.push({ x: sx, z: sz, g: 0, f: h(sx, sz), parent: null });
+    const bubbleUp = (i: number) => {
+      const node = heap[i];
+      while (i > 0) {
+        const pi = (i - 1) >> 1;
+        const parent = heap[pi];
+        if (node.f >= parent.f) break;
+        heap[i] = parent; parent.heapIdx = i;
+        i = pi;
+      }
+      heap[i] = node; node.heapIdx = i;
+    };
+
+    const sinkDown = (i: number) => {
+      const len = heap.length;
+      const node = heap[i];
+      while (true) {
+        let sm = i;
+        const l = 2 * i + 1, r = 2 * i + 2;
+        if (l < len && heap[l].f < heap[sm].f) sm = l;
+        if (r < len && heap[r].f < heap[sm].f) sm = r;
+        if (sm === i) break;
+        heap[i] = heap[sm]; heap[i].heapIdx = i;
+        i = sm;
+      }
+      heap[i] = node; node.heapIdx = i;
+    };
+
+    const pushNode = (n: PNode) => { n.heapIdx = heap.length; heap.push(n); bubbleUp(heap.length - 1); };
+    const popNode = (): PNode => {
+      const top = heap[0];
+      const last = heap.pop()!;
+      if (heap.length > 0) { heap[0] = last; last.heapIdx = 0; sinkDown(0); }
+      return top;
+    };
+
+    const sh = heuristic(sx, sz);
+    const startNode: PNode = { x: sx, z: sz, g: 0, hv: sh, f: sh, parent: null, heapIdx: 0 };
+    pushNode(startNode);
+    openMap.set(key(sx, sz), startNode);
 
     let steps = 0;
-    while (open.length > 0 && steps < 400) {
+    while (heap.length > 0 && steps < maxSteps) {
       steps++;
-      let bestIdx = 0;
-      for (let i = 1; i < open.length; i++) {
-        if (open[i].f < open[bestIdx].f) bestIdx = i;
-      }
-      const current = open.splice(bestIdx, 1)[0];
+      const current = popNode();
+      const ck = key(current.x, current.z);
+      openMap.delete(ck);
 
       if (current.x === gx && current.z === gz) {
         const path: { x: number; z: number }[] = [];
-        let node = current;
+        let node: PNode | null = current;
         while (node && !(node.x === sx && node.z === sz)) {
           path.unshift({ x: node.x + 0.5, z: node.z + 0.5 });
           node = node.parent;
@@ -241,11 +226,9 @@ export class GameMap {
         return path;
       }
 
-      closed.add(key(current.x, current.z));
+      closed.add(ck);
 
-      const dirs: [number, number][] = [
-        [-1, 0], [1, 0], [0, -1], [0, 1],
-      ];
+      const dirs: [number, number][] = [[-1, 0], [1, 0], [0, -1], [0, 1]];
       if (!this.isBlocked(current.x - 1, current.z) && !this.isBlocked(current.x, current.z - 1)) dirs.push([-1, -1]);
       if (!this.isBlocked(current.x + 1, current.z) && !this.isBlocked(current.x, current.z - 1)) dirs.push([1, -1]);
       if (!this.isBlocked(current.x - 1, current.z) && !this.isBlocked(current.x, current.z + 1)) dirs.push([-1, 1]);
@@ -254,23 +237,29 @@ export class GameMap {
       for (const [dx, dz] of dirs) {
         const nx = current.x + dx;
         const nz = current.z + dz;
-        if (closed.has(key(nx, nz))) continue;
-        if (nx < 0 || nx >= MAP_SIZE || nz < 0 || nz >= MAP_SIZE) continue;
+        const nk = key(nx, nz);
+        if (closed.has(nk)) continue;
+        if (nx < 0 || nx >= w || nz < 0 || nz >= h) continue;
         if (this.isBlocked(nx, nz)) continue;
 
-        const isDiagonal = dx !== 0 && dz !== 0;
-        const g = current.g + (isDiagonal ? 1.414 : 1);
-        const f = g + h(nx, nz);
-        const existing = open.find(n => n.x === nx && n.z === nz);
+        const isDiag = dx !== 0 && dz !== 0;
+        const g = current.g + (isDiag ? 1.414 : 1);
+
+        const existing = openMap.get(nk);
         if (existing) {
           if (g < existing.g) {
             existing.g = g;
-            existing.f = f;
+            existing.f = g + existing.hv;
             existing.parent = current;
+            bubbleUp(existing.heapIdx);
           }
           continue;
         }
-        open.push({ x: nx, z: nz, g, f, parent: current });
+
+        const nhv = heuristic(nx, nz);
+        const node: PNode = { x: nx, z: nz, g, hv: nhv, f: g + nhv, parent: current, heapIdx: 0 };
+        pushNode(node);
+        openMap.set(nk, node);
       }
     }
     return [];

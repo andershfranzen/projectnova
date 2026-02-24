@@ -25,6 +25,10 @@ export class Player extends Entity {
   moveQueue: { x: number; z: number }[] = [];
   moveSpeed: number = 1;
 
+  // Chunk tracking
+  currentChunkX: number = -1;
+  currentChunkZ: number = -1;
+
   // Combat
   attackTarget: Entity | null = null;
   attackCooldown: number = 0;
