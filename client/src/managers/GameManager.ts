@@ -103,8 +103,8 @@ export class GameManager {
   private worldObjectModels: Map<number, TransformNode> = new Map();
   private worldObjectDefs: Map<number, { defId: number; x: number; z: number; depleted: boolean }> = new Map();
   private objectDefsCache: Map<number, WorldObjectDef> = new Map();
-  private treeModelTemplate: TransformNode | null = null;
-  private treeModelScale: number = 1;
+  /** Per-defId tree model templates: { template, scale } */
+  private treeModels: Map<number, { template: TransformNode; scale: number }> = new Map();
   private rockModelTemplate: TransformNode | null = null;
   private rockModelScale: number = 1;
   private isSkilling: boolean = false;
@@ -225,7 +225,7 @@ export class GameManager {
       this.repositionWorldObjects();
     });
     this.loadObjectDefs();
-    this.loadTreeModel();
+    this.loadTreeModels();
     this.loadRockModel();
 
     // Game loop
@@ -268,50 +268,54 @@ export class GameManager {
     }
   }
 
-  private async loadTreeModel(): Promise<void> {
-    try {
-      const result = await SceneLoader.ImportMeshAsync('', '/models/', 'pinetree.glb', this.scene);
+  /** Tree model config: defId → GLB file + target height */
+  private static readonly TREE_MODEL_CONFIG: { defId: number; file: string; targetHeight: number }[] = [
+    { defId: 1, file: 'tree.glb', targetHeight: 2.0 },       // Tree (level 1)
+    { defId: 2, file: 'pinetree.glb', targetHeight: 2.5 },    // Oak Tree (level 15)
+  ];
 
-      // Measure bounding box from meshes that have actual geometry (skip __root__ etc.)
-      let minY = Infinity;
-      let maxY = -Infinity;
-      for (const mesh of result.meshes) {
-        if (mesh.getTotalVertices() === 0) continue;
-        mesh.computeWorldMatrix(true);
-        const bb = mesh.getBoundingInfo().boundingBox;
-        if (bb.minimumWorld.y < minY) minY = bb.minimumWorld.y;
-        if (bb.maximumWorld.y > maxY) maxY = bb.maximumWorld.y;
-      }
-      const modelHeight = maxY - minY;
-      this.treeModelScale = modelHeight > 0 ? 2.0 / modelHeight : 1;
+  private async loadTreeModels(): Promise<void> {
+    const loads = GameManager.TREE_MODEL_CONFIG.map(async (cfg) => {
+      try {
+        const result = await SceneLoader.ImportMeshAsync('', '/models/', cfg.file, this.scene);
 
-      // Wrap in a root node and shift model up so its base sits at y=0
-      const root = new TransformNode('treeTemplate', this.scene);
-      for (const mesh of result.meshes) {
-        if (!mesh.parent) {
-          mesh.parent = root;
+        let minY = Infinity;
+        let maxY = -Infinity;
+        for (const mesh of result.meshes) {
+          if (mesh.getTotalVertices() === 0) continue;
+          mesh.computeWorldMatrix(true);
+          const bb = mesh.getBoundingInfo().boundingBox;
+          if (bb.minimumWorld.y < minY) minY = bb.minimumWorld.y;
+          if (bb.maximumWorld.y > maxY) maxY = bb.maximumWorld.y;
         }
-      }
-      // Shift the direct children up so the model base is at y=0 in root-local space
-      for (const child of root.getChildren()) {
-        (child as TransformNode).position.y -= minY;
-      }
+        const modelHeight = maxY - minY;
+        const scale = modelHeight > 0 ? cfg.targetHeight / modelHeight : 1;
 
-      root.setEnabled(false);
-      this.treeModelTemplate = root;
-      console.log(`Tree model loaded (height=${modelHeight.toFixed(2)}, minY=${minY.toFixed(2)}, scale=${this.treeModelScale.toFixed(3)})`);
+        const root = new TransformNode(`treeTemplate_${cfg.defId}`, this.scene);
+        for (const mesh of result.meshes) {
+          if (!mesh.parent) mesh.parent = root;
+        }
+        for (const child of root.getChildren()) {
+          (child as TransformNode).position.y -= minY;
+        }
+        root.setEnabled(false);
 
-      // Retroactively replace any tree sprites that were created before the model loaded
-      this.upgradeTreeSpritesToModels();
-    } catch (e) {
-      console.warn('Failed to load tree model, falling back to sprites:', e);
-    }
+        this.treeModels.set(cfg.defId, { template: root, scale });
+        console.log(`Tree model '${cfg.file}' loaded for defId=${cfg.defId} (height=${modelHeight.toFixed(2)}, scale=${scale.toFixed(3)})`);
+      } catch (e) {
+        console.warn(`Failed to load tree model '${cfg.file}':`, e);
+      }
+    });
+
+    await Promise.all(loads);
+    this.upgradeTreeSpritesToModels();
   }
 
   private createTreeModel(objectEntityId: number, objectDefId: number, x: number, z: number, isDepleted: boolean): void {
-    if (!this.treeModelTemplate) return;
-    // Deep-clone the template hierarchy (TransformNode.clone doesn't clone children)
-    const clone = this.treeModelTemplate.instantiateHierarchy(null, undefined, (source, cloned) => {
+    const model = this.treeModels.get(objectDefId);
+    if (!model) return;
+
+    const clone = model.template.instantiateHierarchy(null, undefined, (source, cloned) => {
       cloned.name = source.name + `_${objectEntityId}`;
     })!;
     clone.setEnabled(!isDepleted);
@@ -319,22 +323,18 @@ export class GameManager {
       child.setEnabled(true);
       child.metadata = { objectEntityId };
     }
-    // Scale: base scale for Tree (~2.0 units), Oak Tree gets 1.2x multiplier
-    const scaleMul = objectDefId === 2 ? 1.2 : 1.0;
-    const s = this.treeModelScale * scaleMul;
+    const s = model.scale;
     clone.scaling.set(s, s, s);
-    // Base is at y=0 in template-local space, so just place at ground height
     clone.position.set(x, this.getHeight(x, z), z);
     this.worldObjectModels.set(objectEntityId, clone);
   }
 
   private upgradeTreeSpritesToModels(): void {
-    if (!this.treeModelTemplate) return;
     for (const [objectEntityId, data] of this.worldObjectDefs) {
       if (this.worldObjectModels.has(objectEntityId)) continue;
       const def = this.objectDefsCache.get(data.defId);
       if (def?.category !== 'tree') continue;
-      // Remove the fallback sprite if one was created
+      if (!this.treeModels.has(data.defId)) continue;
       const sprite = this.worldObjectSprites.get(objectEntityId);
       if (sprite) {
         sprite.dispose();
@@ -670,13 +670,15 @@ export class GameManager {
       const def = this.objectDefsCache.get(objectDefId);
       const isTree = def?.category === 'tree';
       const isRock = def?.category === 'rock';
+      const hasTreeModel = isTree && this.treeModels.has(objectDefId);
+      const hasRockModel = isRock && !!this.rockModelTemplate;
 
       // Create visual if not yet created
-      if (isTree && this.treeModelTemplate && !this.worldObjectModels.has(objectEntityId)) {
+      if (hasTreeModel && !this.worldObjectModels.has(objectEntityId)) {
         this.createTreeModel(objectEntityId, objectDefId, x, z, isDepleted);
-      } else if (isRock && this.rockModelTemplate && !this.worldObjectModels.has(objectEntityId)) {
+      } else if (hasRockModel && !this.worldObjectModels.has(objectEntityId)) {
         this.createRockModel(objectEntityId, objectDefId, x, z, isDepleted);
-      } else if ((!isTree || !this.treeModelTemplate) && (!isRock || !this.rockModelTemplate) && !this.worldObjectSprites.has(objectEntityId) && !this.worldObjectModels.has(objectEntityId)) {
+      } else if (!hasTreeModel && !hasRockModel && !this.worldObjectSprites.has(objectEntityId) && !this.worldObjectModels.has(objectEntityId)) {
         const name = def?.name ?? `Object${objectDefId}`;
         const color = def?.color
           ? new Color3(def.color[0] / 255, def.color[1] / 255, def.color[2] / 255)
@@ -1198,7 +1200,8 @@ export class GameManager {
     this.worldObjectSprites.clear();
     for (const [, model] of this.worldObjectModels) model.dispose();
     this.worldObjectModels.clear();
-    if (this.treeModelTemplate) this.treeModelTemplate.dispose();
+    for (const [, m] of this.treeModels) m.template.dispose();
+    this.treeModels.clear();
     document.getElementById('chat-panel')?.remove();
     document.getElementById('side-panel')?.remove();
     for (const splat of this.hitSplats) splat.el.remove();
