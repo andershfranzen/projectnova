@@ -2,9 +2,98 @@ import { Scene } from '@babylonjs/core/scene';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
+import { Texture } from '@babylonjs/core/Materials/Textures/texture';
 import { Color3 } from '@babylonjs/core/Maths/math.color';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
+
+/**
+ * Directional sprite set — 8-direction materials loaded from 4 sprite images.
+ * Directions: S, SE, E, NE (from files), N (fallback to NE), NW/W/SW (mirrored).
+ * Call updateDirection() each frame with camera angle to swap material.
+ */
+export interface DirectionalSpriteSet {
+  /** Materials for each of 8 directions: S, SE, E, NE, N, NW, W, SW */
+  materials: StandardMaterial[];
+  /** Whether each direction is mirrored (flip plane X scale) */
+  mirrored: boolean[];
+}
+
+/** Direction indices */
+const DIR_S = 0, DIR_SE = 1, DIR_E = 2, DIR_NE = 3;
+const DIR_N = 4, DIR_NW = 5, DIR_W = 6, DIR_SW = 7;
+
+/**
+ * Pre-load a directional sprite set from image files.
+ * Expects: south.png, south-east.png, east.png, north-east.png in basePath.
+ * Optional: north.png (falls back to north-east if missing).
+ * W/SW/NW are auto-mirrored from E/SE/NE.
+ */
+export async function loadDirectionalSprites(scene: Scene, basePath: string, name: string): Promise<DirectionalSpriteSet> {
+  const files = ['south.png', 'south-east.png', 'east.png', 'north-east.png', 'north.png'];
+  const textures: (Texture | null)[] = [];
+
+  for (const file of files) {
+    try {
+      const tex = new Texture(`${basePath}/${file}`, scene, false, true, Texture.NEAREST_SAMPLINGMODE);
+      tex.hasAlpha = true;
+      textures.push(tex);
+    } catch {
+      textures.push(null);
+    }
+  }
+
+  const [texS, texSE, texE, texNE, texN] = textures;
+  const texNorth = (texN && texN.getSize().width > 0) ? texN : texNE; // fallback
+
+  // Create materials: S, SE, E, NE, N, NW(=NE mirrored), W(=E mirrored), SW(=SE mirrored)
+  const makeMat = (label: string, tex: Texture | null): StandardMaterial => {
+    const mat = new StandardMaterial(`${name}_${label}`, scene);
+    if (tex) {
+      mat.diffuseTexture = tex;
+      mat.useAlphaFromDiffuseTexture = true;
+    }
+    mat.specularColor = new Color3(0, 0, 0);
+    mat.emissiveColor = new Color3(0.3, 0.3, 0.3);
+    mat.backFaceCulling = false;
+    return mat;
+  };
+
+  const materials = [
+    makeMat('S', texS),       // 0: S
+    makeMat('SE', texSE),     // 1: SE
+    makeMat('E', texE),       // 2: E
+    makeMat('NE', texNE),     // 3: NE
+    makeMat('N', texNorth),   // 4: N
+    makeMat('NW', texNE),     // 5: NW (mirrored NE)
+    makeMat('W', texE),       // 6: W (mirrored E)
+    makeMat('SW', texSE),     // 7: SW (mirrored SE)
+  ];
+
+  // Mirrored directions: NW, W, SW
+  const mirrored = [false, false, false, false, false, true, true, true];
+
+  return { materials, mirrored };
+}
+
+/**
+ * Compute which of 8 direction indices to use based on camera-to-entity angle.
+ * Returns 0-7 (S, SE, E, NE, N, NW, W, SW).
+ */
+export function getDirectionIndex(cameraPos: Vector3, entityPos: Vector3): number {
+  // Angle from entity to camera (so we show the side facing the camera)
+  const dx = cameraPos.x - entityPos.x;
+  const dz = cameraPos.z - entityPos.z;
+  let angle = Math.atan2(dx, dz); // 0 = camera south of entity (looking at front)
+  if (angle < 0) angle += Math.PI * 2;
+
+  // Quantize to 8 directions (each 45°, offset by 22.5°)
+  const idx = Math.round(angle / (Math.PI / 4)) % 8;
+  // Map: 0=S, 1=SW, 2=W, 3=NW, 4=N, 5=NE, 6=E, 7=SE
+  // We want: 0=S, 1=SE, 2=E, 3=NE, 4=N, 5=NW, 6=W, 7=SW
+  const remap = [DIR_S, DIR_SW, DIR_W, DIR_NW, DIR_N, DIR_NE, DIR_E, DIR_SE];
+  return remap[idx];
+}
 
 export interface SpriteEntityOptions {
   name: string;
@@ -13,6 +102,8 @@ export interface SpriteEntityOptions {
   height?: number;
   label?: string;
   labelColor?: string;
+  /** If provided, uses directional sprites instead of colored rectangle */
+  directionalSprites?: DirectionalSpriteSet;
 }
 
 /**
@@ -27,6 +118,11 @@ export class SpriteEntity {
   private label: string;
   private _position: Vector3 = Vector3.Zero();
   private yOffset: number; // half-height, so feet sit on ground
+  private baseScaleX: number = 1; // original X scale (for mirroring)
+
+  // Directional sprites
+  private dirSprites: DirectionalSpriteSet | null = null;
+  private currentDirIndex: number = -1;
 
   // Health bar (HTML overlay)
   private healthBarEl: HTMLDivElement | null = null;
@@ -46,7 +142,8 @@ export class SpriteEntity {
 
     const width = options.width || 0.8;
     const height = options.height || 1.4;
-    this.yOffset = height / 2; // Position plane so bottom edge sits on ground
+    this.yOffset = height / 2;
+    this.baseScaleX = 1;
 
     // Create billboard plane
     this.plane = MeshBuilder.CreatePlane(
@@ -54,41 +151,65 @@ export class SpriteEntity {
       { width, height },
       scene
     );
-    this.plane.billboardMode = Mesh.BILLBOARDMODE_Y; // face camera horizontally
+    this.plane.billboardMode = Mesh.BILLBOARDMODE_Y;
 
-    // Create dynamic texture for the sprite
-    const texSize = 128;
-    const texture = new DynamicTexture(`${options.name}_tex`, texSize, scene, false);
-    const ctx = texture.getContext();
+    if (options.directionalSprites) {
+      // Use pre-loaded directional sprite materials
+      this.dirSprites = options.directionalSprites;
+      this.plane.material = this.dirSprites.materials[DIR_S]; // default: south
+      this.currentDirIndex = DIR_S;
+    } else {
+      // Fallback: colored rectangle with label (original behavior)
+      const texSize = 128;
+      const texture = new DynamicTexture(`${options.name}_tex`, texSize, scene, false);
+      const ctx = texture.getContext();
 
-    // Draw character body
-    ctx.fillStyle = `rgb(${options.color.r * 255}, ${options.color.g * 255}, ${options.color.b * 255})`;
-    ctx.fillRect(24, 20, 80, 90);
+      ctx.fillStyle = `rgb(${options.color.r * 255}, ${options.color.g * 255}, ${options.color.b * 255})`;
+      ctx.fillRect(24, 20, 80, 90);
 
-    // Draw head
-    ctx.fillStyle = '#eec39a'; // skin color
-    ctx.beginPath();
-    ctx.arc(64, 18, 16, 0, Math.PI * 2);
-    ctx.fill();
+      ctx.fillStyle = '#eec39a';
+      ctx.beginPath();
+      ctx.arc(64, 18, 16, 0, Math.PI * 2);
+      ctx.fill();
 
-    // Draw name label
-    ctx.fillStyle = options.labelColor || '#ffffff';
-    ctx.font = 'bold 14px sans-serif';
-    (ctx as any).textAlign = 'center';
-    ctx.fillText(this.label, 64, 126);
+      ctx.fillStyle = options.labelColor || '#ffffff';
+      ctx.font = 'bold 14px sans-serif';
+      (ctx as any).textAlign = 'center';
+      ctx.fillText(this.label, 64, 126);
 
-    texture.update();
+      texture.update();
 
-    const mat = new StandardMaterial(`${options.name}_mat`, scene);
-    mat.diffuseTexture = texture;
-    mat.specularColor = new Color3(0, 0, 0);
-    mat.emissiveColor = new Color3(0.3, 0.3, 0.3); // Slight glow so visible in shadow
-    mat.backFaceCulling = false;
-    // Enable transparency for the texture
-    texture.hasAlpha = true;
-    mat.useAlphaFromDiffuseTexture = true;
+      const mat = new StandardMaterial(`${options.name}_mat`, scene);
+      mat.diffuseTexture = texture;
+      mat.specularColor = new Color3(0, 0, 0);
+      mat.emissiveColor = new Color3(0.3, 0.3, 0.3);
+      mat.backFaceCulling = false;
+      texture.hasAlpha = true;
+      mat.useAlphaFromDiffuseTexture = true;
 
-    this.plane.material = mat;
+      this.plane.material = mat;
+    }
+  }
+
+  /** Upgrade an existing sprite to use directional sprites (e.g. after async load) */
+  setDirectionalSprites(sprites: DirectionalSpriteSet): void {
+    this.dirSprites = sprites;
+    this.currentDirIndex = DIR_S;
+    this.plane.material = sprites.materials[DIR_S];
+  }
+
+  /**
+   * Update directional sprite based on camera position.
+   * Call each frame for entities with directional sprites.
+   */
+  updateDirection(cameraPos: Vector3): void {
+    if (!this.dirSprites) return;
+    const idx = getDirectionIndex(cameraPos, this._position);
+    if (idx === this.currentDirIndex) return;
+    this.currentDirIndex = idx;
+    this.plane.material = this.dirSprites.materials[idx];
+    // Mirror for W/SW/NW directions
+    this.plane.scaling.x = this.dirSprites.mirrored[idx] ? -this.baseScaleX : this.baseScaleX;
   }
 
   get position(): Vector3 {

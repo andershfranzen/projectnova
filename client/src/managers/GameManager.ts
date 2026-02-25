@@ -11,7 +11,7 @@ import { TransformNode } from '@babylonjs/core/Meshes/transformNode';
 import '@babylonjs/loaders/glTF';
 import { ChunkManager } from '../rendering/ChunkManager';
 import { GameCamera } from '../rendering/Camera';
-import { SpriteEntity } from '../rendering/SpriteEntity';
+import { SpriteEntity, loadDirectionalSprites, type DirectionalSpriteSet } from '../rendering/SpriteEntity';
 import { InputManager } from './InputManager';
 import { NetworkManager } from './NetworkManager';
 import { findPath } from '../rendering/Pathfinding';
@@ -107,6 +107,7 @@ export class GameManager {
   private treeModels: Map<number, { template: TransformNode; scale: number }> = new Map();
   private rockModelTemplate: TransformNode | null = null;
   private rockModelScale: number = 1;
+  private playerSprites: DirectionalSpriteSet | null = null;
   private isSkilling: boolean = false;
   private skillingObjectId: number = -1;
 
@@ -227,6 +228,7 @@ export class GameManager {
     this.loadObjectDefs();
     this.loadTreeModels();
     this.loadRockModel();
+    this.loadPlayerSprites();
 
     // Game loop
     let lastTime = performance.now();
@@ -445,6 +447,28 @@ export class GameManager {
     }
   }
 
+  private async loadPlayerSprites(): Promise<void> {
+    try {
+      this.playerSprites = await loadDirectionalSprites(this.scene, '/sprites/player', 'player');
+      console.log('Player directional sprites loaded');
+      // Upgrade local player if already created
+      if (this.localPlayer) {
+        this.upgradeToDirectionalSprite(this.localPlayer);
+      }
+      // Upgrade existing remote players
+      for (const [, sprite] of this.remotePlayers) {
+        this.upgradeToDirectionalSprite(sprite);
+      }
+    } catch (e) {
+      console.warn('Failed to load player sprites, using fallback:', e);
+    }
+  }
+
+  private upgradeToDirectionalSprite(sprite: SpriteEntity): void {
+    if (!this.playerSprites) return;
+    sprite.setDirectionalSprites(this.playerSprites);
+  }
+
   /** Reposition all world objects/models after heightmap loads (fixes race condition) */
   private repositionWorldObjects(): void {
     for (const [objectEntityId, data] of this.worldObjectDefs) {
@@ -507,6 +531,7 @@ export class GameManager {
         color: new Color3(0.2, 0.4, 0.9),
         label: this.username,
         labelColor: '#00ff00',
+        directionalSprites: this.playerSprites ?? undefined,
       });
       this.localPlayer.position = new Vector3(this.playerX, this.getHeight(this.playerX, this.playerZ), this.playerZ);
       console.log(`Logged in as player ${this.localPlayerId}`);
@@ -538,6 +563,7 @@ export class GameManager {
           color: new Color3(0.8, 0.2, 0.2),
           label: playerName,
           labelColor: '#ffffff',
+          directionalSprites: this.playerSprites ?? undefined,
         });
         sprite.position = new Vector3(x, this.getHeight(x, z), z);
         this.remotePlayers.set(entityId, sprite);
@@ -1392,6 +1418,15 @@ export class GameManager {
     // Camera follows player
     if (this.localPlayer) {
       this.camera.followTarget(new Vector3(this.playerX, this.getHeight(this.playerX, this.playerZ), this.playerZ));
+    }
+
+    // Update directional sprites based on camera angle
+    if (this.scene.activeCamera) {
+      const camPos = this.scene.activeCamera.position;
+      if (this.localPlayer) this.localPlayer.updateDirection(camPos);
+      for (const [, sprite] of this.remotePlayers) {
+        sprite.updateDirection(camPos);
+      }
     }
 
     // Update all HTML overlay positions
