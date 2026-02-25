@@ -4,6 +4,7 @@ import { HeightRenderer } from './HeightRenderer';
 import { SpawnRenderer } from './SpawnRenderer';
 import { GridOverlay } from './GridOverlay';
 import { WallRenderer } from './WallRenderer';
+import { BuildingRenderer } from './BuildingRenderer';
 import type { RectTool } from '../tools/RectTool';
 import type { LineTool } from '../tools/LineTool';
 
@@ -22,6 +23,7 @@ export class MapCanvas {
   private spawnRenderer: SpawnRenderer;
   private gridOverlay: GridOverlay;
   private wallRenderer: WallRenderer;
+  private buildingRenderer: BuildingRenderer;
 
   // Interaction
   private isPanning = false;
@@ -59,6 +61,7 @@ export class MapCanvas {
     this.spawnRenderer = new SpawnRenderer();
     this.gridOverlay = new GridOverlay();
     this.wallRenderer = new WallRenderer(stateMgr);
+    this.buildingRenderer = new BuildingRenderer(stateMgr);
 
     this.setupEvents();
     this.resize();
@@ -249,6 +252,13 @@ export class MapCanvas {
       this.wallRenderer.render(ctx, zoom, offsetX, offsetZ, canvas.width, canvas.height);
     }
 
+    // Building overlays (floors, stairs, roofs, wall heights)
+    if (s.showWalls) {
+      const bOffsetX = -this.scrollX * zoom;
+      const bOffsetZ = -this.scrollZ * zoom;
+      this.buildingRenderer.render(ctx, zoom, bOffsetX, bOffsetZ, canvas.width, canvas.height);
+    }
+
     if (s.showSpawns) {
       this.spawnRenderer.render(ctx, s, this.scrollX, this.scrollZ, zoom);
     }
@@ -298,7 +308,8 @@ export class MapCanvas {
   }
 
   private renderBrushCursor(ctx: CanvasRenderingContext2D, s: import('../state/EditorState').EditorState): void {
-    if (s.activeTool !== 'tile' && s.activeTool !== 'height' && s.activeTool !== 'line') return;
+    const brushTools = new Set(['tile', 'height', 'line', 'floor', 'roof']);
+    if (!brushTools.has(s.activeTool)) return;
 
     const half = Math.floor(s.brushSize / 2);
     const tileX = Math.floor(this.mouseWorldX) - half;

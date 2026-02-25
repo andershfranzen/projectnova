@@ -41,4 +41,5 @@ export enum ServerOpcode {
   SKILLING_START = 57,
   SKILLING_STOP = 58,
   MAP_CHANGE = 60,
+  FLOOR_CHANGE = 61,
 }

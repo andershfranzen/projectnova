@@ -2,7 +2,7 @@ import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import { PNG } from 'pngjs';
 import { CHUNK_SIZE, TileType, BLOCKING_TILES, tileTypeFromRgb, WallEdge, DEFAULT_WALL_HEIGHT } from '@projectrs/shared';
-import type { MapMeta, MapTransition, WallsFile, StairData, RoofData } from '@projectrs/shared';
+import type { MapMeta, MapTransition, WallsFile, StairData, RoofData, FloorLayerData } from '@projectrs/shared';
 
 const MAPS_DIR = resolve(import.meta.dir, '../data/maps');
 
@@ -29,6 +29,16 @@ export class GameMap {
   private stairs: Map<number, StairData> = new Map();
   /** Roof data (sparse) */
   private roofs: Map<number, RoofData> = new Map();
+
+  /** Multi-floor layer data */
+  private floorLayers: Map<number, {
+    tiles: Map<number, number>;
+    walls: Map<number, number>;
+    wallHeights: Map<number, number>;
+    floors: Map<number, number>;
+    stairs: Map<number, StairData>;
+    roofs: Map<number, RoofData>;
+  }> = new Map();
 
   private minH: number;
   private maxH: number;
@@ -114,9 +124,102 @@ export class GameMap {
           if (coords) this.roofs.set(coords[1] * this.width + coords[0], data);
         }
       }
+      // Load floor layers
+      if (wallsData.floorLayers) {
+        for (const [floorStr, ld] of Object.entries(wallsData.floorLayers)) {
+          const floorIdx = parseInt(floorStr);
+          const layer = {
+            tiles: new Map<number, number>(),
+            walls: new Map<number, number>(),
+            wallHeights: new Map<number, number>(),
+            floors: new Map<number, number>(),
+            stairs: new Map<number, StairData>(),
+            roofs: new Map<number, RoofData>(),
+          };
+          if (ld.tiles) for (const [k, v] of Object.entries(ld.tiles)) { const c = parseKey(k); if (c) layer.tiles.set(c[1] * this.width + c[0], v as number); }
+          if (ld.walls) for (const [k, v] of Object.entries(ld.walls)) { const c = parseKey(k); if (c) layer.walls.set(c[1] * this.width + c[0], v as number); }
+          if (ld.wallHeights) for (const [k, v] of Object.entries(ld.wallHeights)) { const c = parseKey(k); if (c) layer.wallHeights.set(c[1] * this.width + c[0], v as number); }
+          if (ld.floors) for (const [k, v] of Object.entries(ld.floors)) { const c = parseKey(k); if (c) layer.floors.set(c[1] * this.width + c[0], v as number); }
+          if (ld.stairs) for (const [k, v] of Object.entries(ld.stairs)) { const c = parseKey(k); if (c) layer.stairs.set(c[1] * this.width + c[0], v as StairData); }
+          if (ld.roofs) for (const [k, v] of Object.entries(ld.roofs)) { const c = parseKey(k); if (c) layer.roofs.set(c[1] * this.width + c[0], v as RoofData); }
+          this.floorLayers.set(floorIdx, layer);
+        }
+      }
     }
 
-    console.log(`Loaded map '${mapId}': ${this.width}x${this.height} tiles, height range [${this.minH}, ${this.maxH}]`);
+    console.log(`Loaded map '${mapId}': ${this.width}x${this.height} tiles, height range [${this.minH}, ${this.maxH}], ${this.floorLayers.size} upper floors`);
+  }
+
+  /** Get floor layer data (null = ground floor) */
+  getFloorLayer(floor: number) {
+    if (floor === 0) return null;
+    return this.floorLayers.get(floor) ?? null;
+  }
+
+  /** Get wall bitmask at position for a specific floor */
+  getWallOnFloor(x: number, z: number, floor: number): number {
+    if (floor === 0) return this.getWall(x, z);
+    const layer = this.floorLayers.get(floor);
+    if (!layer) return 0;
+    const idx = z * this.width + x;
+    return layer.walls.get(idx) ?? 0;
+  }
+
+  /** Check if a tile is walkable on a specific floor */
+  isTileBlockedOnFloor(x: number, z: number, floor: number): boolean {
+    if (floor === 0) return this.isTileBlocked(x, z);
+    const layer = this.floorLayers.get(floor);
+    if (!layer) return true; // no floor layer = can't walk
+    // Must have a floor or tiles defined
+    const idx = z * this.width + x;
+    const hasTile = layer.tiles.has(idx);
+    const hasFloor = layer.floors.has(idx);
+    const hasStair = layer.stairs.has(idx);
+    return !(hasTile || hasFloor || hasStair);
+  }
+
+  /** Check wall blocking for a specific floor */
+  isWallBlockedOnFloor(fromX: number, fromZ: number, toX: number, toZ: number, floor: number): boolean {
+    if (floor === 0) return this.isWallBlocked(fromX, fromZ, toX, toZ);
+    const fx = Math.floor(fromX);
+    const fz = Math.floor(fromZ);
+    const tx = Math.floor(toX);
+    const tz = Math.floor(toZ);
+    const dx = tx - fx;
+    const dz = tz - fz;
+
+    const getW = (x: number, z: number) => this.getWallOnFloor(x, z, floor);
+
+    if (dx === 0 && dz === -1) return (getW(fx, fz) & WallEdge.N) !== 0;
+    if (dx === 1 && dz === 0) return (getW(fx, fz) & WallEdge.E) !== 0;
+    if (dx === 0 && dz === 1) return (getW(fx, fz) & WallEdge.S) !== 0;
+    if (dx === -1 && dz === 0) return (getW(fx, fz) & WallEdge.W) !== 0;
+
+    if (dx === 1 && dz === -1) {
+      return (getW(fx, fz) & WallEdge.N) !== 0 || (getW(fx, fz) & WallEdge.E) !== 0
+          || (getW(tx, tz) & WallEdge.S) !== 0 || (getW(tx, tz) & WallEdge.W) !== 0;
+    }
+    if (dx === -1 && dz === -1) {
+      return (getW(fx, fz) & WallEdge.N) !== 0 || (getW(fx, fz) & WallEdge.W) !== 0
+          || (getW(tx, tz) & WallEdge.S) !== 0 || (getW(tx, tz) & WallEdge.E) !== 0;
+    }
+    if (dx === 1 && dz === 1) {
+      return (getW(fx, fz) & WallEdge.S) !== 0 || (getW(fx, fz) & WallEdge.E) !== 0
+          || (getW(tx, tz) & WallEdge.N) !== 0 || (getW(tx, tz) & WallEdge.W) !== 0;
+    }
+    if (dx === -1 && dz === 1) {
+      return (getW(fx, fz) & WallEdge.S) !== 0 || (getW(fx, fz) & WallEdge.W) !== 0
+          || (getW(tx, tz) & WallEdge.N) !== 0 || (getW(tx, tz) & WallEdge.E) !== 0;
+    }
+    return false;
+  }
+
+  /** Get stair on a specific floor */
+  getStairOnFloor(x: number, z: number, floor: number): StairData | null {
+    if (floor === 0) return this.getStair(x, z);
+    const layer = this.floorLayers.get(floor);
+    if (!layer) return null;
+    return layer.stairs.get(z * this.width + x) ?? null;
   }
 
   /** Get height at a vertex coordinate */

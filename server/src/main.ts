@@ -207,8 +207,9 @@ const server = Bun.serve<SocketData>({
           floors?: Record<string, number>;
           stairs?: Record<string, any>;
           roofs?: Record<string, any>;
+          floorLayers?: Record<number, any>;
         };
-        const { mapId, meta, spawns, tilemap, heightmap, walls, wallHeights, floors, stairs, roofs } = body;
+        const { mapId, meta, spawns, tilemap, heightmap, walls, wallHeights, floors, stairs, roofs, floorLayers } = body;
         if (!mapId || !meta || !tilemap || !heightmap) {
           return jsonResponse({ ok: false, error: 'Missing fields' }, 400);
         }
@@ -258,6 +259,7 @@ const server = Bun.serve<SocketData>({
         if (floors && Object.keys(floors).length > 0) wallsFile.floors = floors;
         if (stairs && Object.keys(stairs).length > 0) wallsFile.stairs = stairs;
         if (roofs && Object.keys(roofs).length > 0) wallsFile.roofs = roofs;
+        if (floorLayers && Object.keys(floorLayers).length > 0) wallsFile.floorLayers = floorLayers;
         writeFileSync(resolve(mapDir, 'walls.json'), JSON.stringify(wallsFile, null, 2));
 
         return jsonResponse({ ok: true });

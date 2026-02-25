@@ -1,5 +1,5 @@
 import { TILEMAP_COLORS } from '@projectrs/shared';
-import type { EditorState } from '../state/EditorState';
+import type { EditorState, FloorLayer } from '../state/EditorState';
 
 // Pre-compute tile colors as [r, g, b] arrays
 const TILE_RGB: [number, number, number][] = TILEMAP_COLORS.map(c => [c.r, c.g, c.b]);
@@ -45,6 +45,9 @@ export class TileRenderer {
 
     const data = this.imageDataCache.data;
     const mapW = state.meta.width;
+    const layer: FloorLayer | undefined = state.currentFloor > 0
+      ? state.floorLayers.get(state.currentFloor)
+      : undefined;
 
     // Fill with background
     data.fill(0);
@@ -60,13 +63,34 @@ export class TileRenderer {
         const tx = Math.floor(worldX);
         if (tx < 0 || tx >= mapW) continue;
 
-        const tileType = state.tiles[tz * mapW + tx];
-        const rgb = TILE_RGB[tileType] || TILE_RGB[0];
-        const idx = (py * canvasW + px) * 4;
-        data[idx] = rgb[0];
-        data[idx + 1] = rgb[1];
-        data[idx + 2] = rgb[2];
-        data[idx + 3] = 255;
+        const tileIdx = tz * mapW + tx;
+        const pixIdx = (py * canvasW + px) * 4;
+
+        if (layer) {
+          const floorTile = layer.tiles.get(tileIdx);
+          if (floorTile !== undefined && floorTile >= 0) {
+            const rgb = TILE_RGB[floorTile] || TILE_RGB[0];
+            data[pixIdx] = rgb[0];
+            data[pixIdx + 1] = rgb[1];
+            data[pixIdx + 2] = rgb[2];
+            data[pixIdx + 3] = 255;
+          } else {
+            // Dim ground
+            const groundType = state.tiles[tileIdx];
+            const rgb = TILE_RGB[groundType] || TILE_RGB[0];
+            data[pixIdx] = Math.floor(rgb[0] * 0.25);
+            data[pixIdx + 1] = Math.floor(rgb[1] * 0.25);
+            data[pixIdx + 2] = Math.floor(rgb[2] * 0.25);
+            data[pixIdx + 3] = 255;
+          }
+        } else {
+          const tileType = state.tiles[tileIdx];
+          const rgb = TILE_RGB[tileType] || TILE_RGB[0];
+          data[pixIdx] = rgb[0];
+          data[pixIdx + 1] = rgb[1];
+          data[pixIdx + 2] = rgb[2];
+          data[pixIdx + 3] = 255;
+        }
       }
     }
 
@@ -83,17 +107,36 @@ export class TileRenderer {
   ): void {
     const mapW = state.meta.width;
     const tileSize = zoom;
+    const layer: FloorLayer | undefined = state.currentFloor > 0
+      ? state.floorLayers.get(state.currentFloor)
+      : undefined;
 
     for (let tz = startZ; tz < endZ; tz++) {
       for (let tx = startX; tx < endX; tx++) {
-        const tileType = state.tiles[tz * mapW + tx];
-        const rgb = TILE_RGB[tileType] || TILE_RGB[0];
-
         const sx = (tx - scrollX) * zoom;
         const sz = (tz - scrollZ) * zoom;
+        const idx = tz * mapW + tx;
 
-        ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
-        ctx.fillRect(sx, sz, tileSize + 0.5, tileSize + 0.5); // +0.5 to avoid gaps
+        if (layer) {
+          // Upper floor: show ground dimmed, then overlay floor tiles
+          const groundType = state.tiles[idx];
+          const groundRgb = TILE_RGB[groundType] || TILE_RGB[0];
+          // Dim ground floor
+          ctx.fillStyle = `rgba(${groundRgb[0]},${groundRgb[1]},${groundRgb[2]},0.25)`;
+          ctx.fillRect(sx, sz, tileSize + 0.5, tileSize + 0.5);
+
+          const floorTile = layer.tiles.get(idx);
+          if (floorTile !== undefined && floorTile >= 0) {
+            const rgb = TILE_RGB[floorTile] || TILE_RGB[0];
+            ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+            ctx.fillRect(sx, sz, tileSize + 0.5, tileSize + 0.5);
+          }
+        } else {
+          const tileType = state.tiles[idx];
+          const rgb = TILE_RGB[tileType] || TILE_RGB[0];
+          ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+          ctx.fillRect(sx, sz, tileSize + 0.5, tileSize + 0.5);
+        }
       }
     }
   }

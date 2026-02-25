@@ -1,4 +1,4 @@
-import { tileTypeFromRgb, type MapMeta, type SpawnsFile, type NpcDef, type WorldObjectDef, type WallsFile, type StairData, type RoofData } from '@projectrs/shared';
+import { tileTypeFromRgb, type MapMeta, type SpawnsFile, type NpcDef, type WorldObjectDef, type WallsFile, type StairData, type RoofData, type FloorLayerData } from '@projectrs/shared';
 
 export interface MapListEntry {
   id: string;
@@ -17,6 +17,7 @@ export interface LoadedMap {
   floors: Map<number, number>;         // sparse: tileIdx -> floor height
   stairs: Map<number, StairData>;      // sparse: tileIdx -> stair data
   roofs: Map<number, RoofData>;        // sparse: tileIdx -> roof data
+  floorLayers: Map<number, import('../state/EditorState').FloorLayer>;
 }
 
 export class EditorApi {
@@ -109,7 +110,42 @@ export class EditorApi {
       }
     } catch { /* ok */ }
 
-    return { meta, spawns, tiles, heights, walls, wallHeights, floors, stairs, roofs };
+    // Load floor layers
+    const floorLayers = new Map<number, import('../state/EditorState').FloorLayer>();
+    try {
+      const wallsRes3 = await fetch(`/maps/${mapId}/walls.json?t=${Date.now()}`);
+      if (wallsRes3.ok) {
+        const wd: WallsFile = await wallsRes3.json();
+        if (wd.floorLayers) {
+          for (const [floorStr, layerData] of Object.entries(wd.floorLayers)) {
+            const floorIdx = parseInt(floorStr);
+            const layer: import('../state/EditorState').FloorLayer = {
+              tiles: new Map(),
+              walls: new Map(),
+              wallHeights: new Map(),
+              floors: new Map(),
+              stairs: new Map(),
+              roofs: new Map(),
+            };
+            const parseIdx2 = (key: string): number | null => {
+              const [xs, zs] = key.split(',');
+              const x = parseInt(xs), z = parseInt(zs);
+              if (x >= 0 && x < meta.width && z >= 0 && z < meta.height) return z * meta.width + x;
+              return null;
+            };
+            if (layerData.tiles) for (const [k, v] of Object.entries(layerData.tiles)) { const i = parseIdx2(k); if (i !== null) layer.tiles.set(i, v); }
+            if (layerData.walls) for (const [k, v] of Object.entries(layerData.walls)) { const i = parseIdx2(k); if (i !== null) layer.walls.set(i, v); }
+            if (layerData.wallHeights) for (const [k, v] of Object.entries(layerData.wallHeights)) { const i = parseIdx2(k); if (i !== null) layer.wallHeights.set(i, v); }
+            if (layerData.floors) for (const [k, v] of Object.entries(layerData.floors)) { const i = parseIdx2(k); if (i !== null) layer.floors.set(i, v); }
+            if (layerData.stairs) for (const [k, v] of Object.entries(layerData.stairs)) { const i = parseIdx2(k); if (i !== null) layer.stairs.set(i, v as StairData); }
+            if (layerData.roofs) for (const [k, v] of Object.entries(layerData.roofs)) { const i = parseIdx2(k); if (i !== null) layer.roofs.set(i, v as RoofData); }
+            floorLayers.set(floorIdx, layer);
+          }
+        }
+      }
+    } catch { /* ok */ }
+
+    return { meta, spawns, tiles, heights, walls, wallHeights, floors, stairs, roofs, floorLayers };
   }
 
   async saveMap(mapId: string, map: LoadedMap): Promise<void> {
@@ -136,6 +172,33 @@ export class EditorApi {
       return out;
     };
 
+    // Serialize floor layers
+    let floorLayersObj: Record<number, FloorLayerData> | undefined;
+    if (map.floorLayers && map.floorLayers.size > 0) {
+      floorLayersObj = {};
+      for (const [floorIdx, layer] of map.floorLayers) {
+        const ld: FloorLayerData = { walls: {} };
+        for (const [idx, v] of layer.walls) {
+          const x = idx % meta.width;
+          const z = Math.floor(idx / meta.width);
+          ld.walls[`${x},${z}`] = v;
+        }
+        if (layer.tiles.size > 0) {
+          ld.tiles = {};
+          for (const [idx, v] of layer.tiles) {
+            const x = idx % meta.width;
+            const z = Math.floor(idx / meta.width);
+            ld.tiles[`${x},${z}`] = v;
+          }
+        }
+        if (layer.wallHeights.size > 0) ld.wallHeights = toSparse(layer.wallHeights);
+        if (layer.floors.size > 0) ld.floors = toSparse(layer.floors);
+        if (layer.stairs.size > 0) ld.stairs = toSparse(layer.stairs);
+        if (layer.roofs.size > 0) ld.roofs = toSparse(layer.roofs);
+        floorLayersObj[floorIdx] = ld;
+      }
+    }
+
     const res = await fetch('/api/editor/save-map', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -150,6 +213,7 @@ export class EditorApi {
         floors: map.floors.size > 0 ? toSparse(map.floors) : undefined,
         stairs: map.stairs.size > 0 ? toSparse(map.stairs) : undefined,
         roofs: map.roofs.size > 0 ? toSparse(map.roofs) : undefined,
+        floorLayers: floorLayersObj,
       }),
     });
     const data = await res.json();

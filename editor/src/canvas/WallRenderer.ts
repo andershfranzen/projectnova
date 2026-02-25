@@ -38,7 +38,9 @@ export class WallRenderer {
 
     for (let z = startZ; z < endZ; z++) {
       for (let x = startX; x < endX; x++) {
-        const mask = s.walls[z * w + x];
+        const layer = this.stateMgr.getActiveFloorLayer();
+        const idx = z * w + x;
+        const mask = layer ? (layer.walls.get(idx) ?? 0) : s.walls[idx];
         if (mask === 0) continue;
 
         const px = offsetX + x * zoom;

@@ -122,13 +122,20 @@ export interface RoofData {
   peakHeight?: number;  // extra height for peaked roofs (above height)
 }
 
-/** On-disk format for walls.json — sparse, only tiles with walls/roofs/floors/stairs */
-export interface WallsFile {
+/** Data for a single floor layer (used in multi-floor system) */
+export interface FloorLayerData {
   walls: Record<string, number>;              // "x,z" -> edge bitmask
   wallHeights?: Record<string, number>;       // "x,z" -> wall top height (default 1.8 above floor)
   roofs?: Record<string, RoofData>;           // "x,z" -> roof data
   floors?: Record<string, number>;            // "x,z" -> elevated floor height
   stairs?: Record<string, StairData>;         // "x,z" -> stair data
+  tiles?: Record<string, number>;             // "x,z" -> tile type override (upper floors only)
+}
+
+/** On-disk format for walls.json — sparse, only tiles with walls/roofs/floors/stairs */
+export interface WallsFile extends FloorLayerData {
+  /** Additional floor layers (1, 2, ...). Floor 0 is the root level data. */
+  floorLayers?: Record<number, FloorLayerData>;
 }
 
 // --- World object definition ---

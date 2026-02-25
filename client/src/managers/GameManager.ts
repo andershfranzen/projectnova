@@ -70,6 +70,7 @@ export class GameManager {
   // Local player
   private localPlayer: SpriteEntity | null = null;
   private localPlayerId: number = -1;
+  private currentFloor: number = 0;
   private playerX: number = 512;
   private playerZ: number = 512;
   private playerHealth: number = 10;
@@ -685,6 +686,15 @@ export class GameManager {
           this.chatPanel.addSystemMessage(`Level up! ${skillName} is now level ${newLevel}!`, '#ff0');
         }
       }
+    });
+
+    // Handle FLOOR_CHANGE
+    this.network.on(ServerOpcode.FLOOR_CHANGE, (_op, values) => {
+      const newFloor = values[0];
+      this.currentFloor = newFloor;
+      console.log(`Floor changed to ${newFloor}`);
+      // Update chunk visibility for multi-floor
+      this.chunkManager.setCurrentFloor(newFloor);
     });
 
     // Handle MAP_CHANGE as a raw binary handler

@@ -947,6 +947,12 @@ export class ChunkManager {
     return meshes;
   }
 
+  /** Set the active floor for multi-floor rendering (placeholder for Phase 4 culling) */
+  setCurrentFloor(floor: number): void {
+    // TODO: Phase 4 — hide floors above current, dim floors below
+    console.log(`[ChunkManager] Current floor set to ${floor}`);
+  }
+
   disposeAll(): void {
     for (const [, meshes] of this.chunks) {
       meshes.ground.dispose();

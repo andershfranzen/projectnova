@@ -20,6 +20,9 @@ import { LineTool } from './tools/LineTool';
 import { SelectTool } from './tools/SelectTool';
 import { SpawnDragger } from './tools/SpawnDragger';
 import { WallBrush } from './tools/WallBrush';
+import { FloorBrush } from './tools/FloorBrush';
+import { StairPlacer } from './tools/StairPlacer';
+import { RoofBrush } from './tools/RoofBrush';
 import type { EditorToolInterface, EditorToolContext } from './tools/BaseTool';
 
 const RECENT_MAPS_KEY = 'projectrs-editor-recent-maps';
@@ -63,6 +66,9 @@ export class EditorApp {
     line: this.lineTool,
     select: new SelectTool(),
     wall: new WallBrush(),
+    floor: new FloorBrush(),
+    stair: new StairPlacer(),
+    roof: new RoofBrush(),
   };
 
   private toolCtx!: EditorToolContext;
@@ -253,6 +259,8 @@ export class EditorApp {
       s.floors = data.floors;
       s.stairs = data.stairs;
       s.roofs = data.roofs;
+      s.floorLayers = data.floorLayers;
+      s.currentFloor = 0;
       s.dirty = false;
       s.selection = null;
 
@@ -281,6 +289,7 @@ export class EditorApp {
       await this.api.saveMap(s.mapId, {
         meta: s.meta, spawns: s.spawns, tiles: s.tiles, heights: s.heights, walls: s.walls,
         wallHeights: s.wallHeights, floors: s.floors, stairs: s.stairs, roofs: s.roofs,
+        floorLayers: s.floorLayers,
       });
       s.dirty = false;
       showToast('Map saved');

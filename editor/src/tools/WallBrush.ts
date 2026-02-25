@@ -1,5 +1,5 @@
 import type { EditorToolInterface, EditorToolContext } from './BaseTool';
-import { WallEdge } from '@projectrs/shared';
+import { WallEdge, DEFAULT_WALL_HEIGHT } from '@projectrs/shared';
 
 /**
  * Wall brush tool — click on tile edges to toggle wall segments.
@@ -53,8 +53,17 @@ export class WallBrush implements EditorToolInterface {
 
     if (hasEdge) {
       ctx.stateMgr.setWall(tileX, tileZ, current & ~edge);
+      // Remove wall height if no walls left
+      if ((current & ~edge) === 0) {
+        ctx.stateMgr.removeWallHeight(tileX, tileZ);
+      }
     } else {
       ctx.stateMgr.setWall(tileX, tileZ, current | edge);
+      // Apply wall height override if not default
+      const wh = ctx.stateMgr.state.wallHeightValue;
+      if (Math.abs(wh - DEFAULT_WALL_HEIGHT) > 0.01) {
+        ctx.stateMgr.setWallHeight(tileX, tileZ, wh);
+      }
     }
 
     // Set reciprocal on neighbor

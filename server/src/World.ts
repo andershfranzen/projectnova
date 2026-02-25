@@ -869,6 +869,29 @@ export class World {
       const transition = map.getTransitionAt(player.position.x, player.position.y);
       if (transition) {
         this.handleMapTransition(player, transition);
+        continue;
+      }
+
+      // Check stair floor transitions
+      const tx = Math.floor(player.position.x);
+      const tz = Math.floor(player.position.y);
+      const oldFloor = player.currentFloor;
+      const stair = map.getStairOnFloor(tx, tz, player.currentFloor);
+      if (stair) {
+        // Check if there's a corresponding stair on the floor above
+        const upperStair = map.getStairOnFloor(tx, tz, player.currentFloor + 1);
+        if (upperStair) {
+          player.currentFloor += 1;
+        }
+      } else if (player.currentFloor > 0) {
+        // Check if standing on a stair from the floor below (descend)
+        const lowerStair = map.getStairOnFloor(tx, tz, player.currentFloor - 1);
+        if (lowerStair) {
+          player.currentFloor -= 1;
+        }
+      }
+      if (player.currentFloor !== oldFloor) {
+        this.sendToPlayer(player, ServerOpcode.FLOOR_CHANGE, player.currentFloor);
       }
     }
 

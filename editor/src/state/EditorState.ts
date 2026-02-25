@@ -1,6 +1,27 @@
-import type { MapMeta, SpawnsFile, SpawnEntry, ObjectSpawnEntry, NpcDef, WorldObjectDef, StairData, RoofData } from '@projectrs/shared';
+import type { MapMeta, SpawnsFile, SpawnEntry, ObjectSpawnEntry, NpcDef, WorldObjectDef, StairData, RoofData, RoofStyle, StairDirection, FloorLayerData } from '@projectrs/shared';
 
-export type EditorTool = 'tile' | 'height' | 'npc' | 'object' | 'eraser' | 'eyedropper' | 'fill' | 'rect' | 'line' | 'select' | 'wall';
+/** In-memory representation of a floor layer (for floors 1+) */
+export interface FloorLayer {
+  tiles: Map<number, number>;            // sparse tileIdx -> tile type
+  walls: Map<number, number>;            // sparse tileIdx -> wall bitmask
+  wallHeights: Map<number, number>;
+  floors: Map<number, number>;
+  stairs: Map<number, StairData>;
+  roofs: Map<number, RoofData>;
+}
+
+export function createFloorLayer(): FloorLayer {
+  return {
+    tiles: new Map(),
+    walls: new Map(),
+    wallHeights: new Map(),
+    floors: new Map(),
+    stairs: new Map(),
+    roofs: new Map(),
+  };
+}
+
+export type EditorTool = 'tile' | 'height' | 'npc' | 'object' | 'eraser' | 'eyedropper' | 'fill' | 'rect' | 'line' | 'select' | 'wall' | 'floor' | 'stair' | 'roof';
 export type HeightMode = 'set' | 'raise' | 'lower' | 'smooth';
 
 export interface ClipboardRegion {
@@ -24,6 +45,9 @@ export interface EditorState {
   stairs: Map<number, StairData>;      // sparse: tileIdx -> stair data
   roofs: Map<number, RoofData>;        // sparse: tileIdx -> roof data
 
+  // Multi-floor layer data (floor 1+). Floor 0 uses the above arrays.
+  floorLayers: Map<number, FloorLayer>;  // floorIndex -> layer data
+
   // Tool state
   activeTool: EditorTool;
   selectedTileType: number;
@@ -33,6 +57,19 @@ export interface EditorState {
   heightDelta: number;
   selectedNpcId: number;
   selectedObjectId: number;
+
+  // Building tool state
+  wallHeightValue: number;       // wall height override for wall tool
+  floorHeightValue: number;      // elevated floor height
+  stairDirection: StairDirection; // stair direction
+  stairBaseHeight: number;
+  stairTopHeight: number;
+  roofStyle: RoofStyle;
+  roofHeight: number;
+  roofPeakHeight: number;
+
+  // Multi-floor
+  currentFloor: number;          // which floor layer is being edited
 
   // Selection state
   selection: { x: number; z: number; w: number; h: number } | null;
@@ -70,6 +107,7 @@ export function createInitialState(): EditorState {
     floors: new Map(),
     stairs: new Map(),
     roofs: new Map(),
+    floorLayers: new Map(),
 
     activeTool: 'tile',
     selectedTileType: 0,
@@ -79,6 +117,17 @@ export function createInitialState(): EditorState {
     heightDelta: 10,
     selectedNpcId: 1,
     selectedObjectId: 1,
+
+    wallHeightValue: 1.8,
+    floorHeightValue: 3.0,
+    stairDirection: 'N' as StairDirection,
+    stairBaseHeight: 0,
+    stairTopHeight: 3.0,
+    roofStyle: 'flat' as RoofStyle,
+    roofHeight: 4.0,
+    roofPeakHeight: 1.0,
+
+    currentFloor: 0,
 
     selection: null,
     clipboard: null,
@@ -115,13 +164,24 @@ export class StateManager {
   setTile(x: number, z: number, type: number): void {
     const { meta } = this.state;
     if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
-    this.state.tiles[z * meta.width + x] = type;
+    const layer = this.getActiveFloorLayer();
+    if (layer) {
+      const idx = z * meta.width + x;
+      layer.tiles.set(idx, type);
+    } else {
+      this.state.tiles[z * meta.width + x] = type;
+    }
     this.state.dirty = true;
   }
 
   getTile(x: number, z: number): number {
     const { meta } = this.state;
     if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return 0;
+    const layer = this.getActiveFloorLayer();
+    if (layer) {
+      const idx = z * meta.width + x;
+      return layer.tiles.get(idx) ?? -1; // -1 = no tile on this floor
+    }
     return this.state.tiles[z * meta.width + x];
   }
 
@@ -145,13 +205,15 @@ export class StateManager {
   getWall(x: number, z: number): number {
     const { meta } = this.state;
     if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return 0;
-    return this.state.walls[z * meta.width + x];
+    const idx = z * meta.width + x;
+    return this.getActiveWalls().get(idx);
   }
 
   setWall(x: number, z: number, mask: number): void {
     const { meta } = this.state;
     if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
-    this.state.walls[z * meta.width + x] = mask;
+    const idx = z * meta.width + x;
+    this.getActiveWalls().set(idx, mask);
     this.state.dirty = true;
   }
 
@@ -202,6 +264,118 @@ export class StateManager {
     }
     this.state.dirty = true;
     return true;
+  }
+
+  /** Get the active floor layer (null = floor 0 ground) */
+  getActiveFloorLayer(): FloorLayer | null {
+    const floor = this.state.currentFloor;
+    if (floor === 0) return null;
+    let layer = this.state.floorLayers.get(floor);
+    if (!layer) {
+      layer = createFloorLayer();
+      this.state.floorLayers.set(floor, layer);
+    }
+    return layer;
+  }
+
+  /** Get walls map for active floor */
+  getActiveWalls(): { get: (idx: number) => number; set: (idx: number, val: number) => void } {
+    const layer = this.getActiveFloorLayer();
+    if (!layer) {
+      const s = this.state;
+      return {
+        get: (idx: number) => s.walls[idx] ?? 0,
+        set: (idx: number, val: number) => { s.walls[idx] = val; },
+      };
+    }
+    return {
+      get: (idx: number) => layer.walls.get(idx) ?? 0,
+      set: (idx: number, val: number) => { if (val === 0) layer.walls.delete(idx); else layer.walls.set(idx, val); },
+    };
+  }
+
+  /** Get the active wallHeights map */
+  getActiveWallHeights(): Map<number, number> {
+    const layer = this.getActiveFloorLayer();
+    return layer ? layer.wallHeights : this.state.wallHeights;
+  }
+
+  /** Get the active floors map */
+  getActiveFloors(): Map<number, number> {
+    const layer = this.getActiveFloorLayer();
+    return layer ? layer.floors : this.state.floors;
+  }
+
+  /** Get the active stairs map */
+  getActiveStairs(): Map<number, StairData> {
+    const layer = this.getActiveFloorLayer();
+    return layer ? layer.stairs : this.state.stairs;
+  }
+
+  /** Get the active roofs map */
+  getActiveRoofs(): Map<number, RoofData> {
+    const layer = this.getActiveFloorLayer();
+    return layer ? layer.roofs : this.state.roofs;
+  }
+
+  tileIdx(x: number, z: number): number {
+    return z * this.state.meta.width + x;
+  }
+
+  setFloor(x: number, z: number, height: number): void {
+    const { meta } = this.state;
+    if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
+    this.getActiveFloors().set(this.tileIdx(x, z), height);
+    this.state.dirty = true;
+  }
+
+  removeFloor(x: number, z: number): void {
+    const { meta } = this.state;
+    if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
+    this.getActiveFloors().delete(this.tileIdx(x, z));
+    this.state.dirty = true;
+  }
+
+  setStair(x: number, z: number, data: StairData): void {
+    const { meta } = this.state;
+    if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
+    this.getActiveStairs().set(this.tileIdx(x, z), data);
+    this.state.dirty = true;
+  }
+
+  removeStair(x: number, z: number): void {
+    const { meta } = this.state;
+    if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
+    this.getActiveStairs().delete(this.tileIdx(x, z));
+    this.state.dirty = true;
+  }
+
+  setRoof(x: number, z: number, data: RoofData): void {
+    const { meta } = this.state;
+    if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
+    this.getActiveRoofs().set(this.tileIdx(x, z), data);
+    this.state.dirty = true;
+  }
+
+  removeRoof(x: number, z: number): void {
+    const { meta } = this.state;
+    if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
+    this.getActiveRoofs().delete(this.tileIdx(x, z));
+    this.state.dirty = true;
+  }
+
+  setWallHeight(x: number, z: number, height: number): void {
+    const { meta } = this.state;
+    if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
+    this.getActiveWallHeights().set(this.tileIdx(x, z), height);
+    this.state.dirty = true;
+  }
+
+  removeWallHeight(x: number, z: number): void {
+    const { meta } = this.state;
+    if (x < 0 || x >= meta.width || z < 0 || z >= meta.height) return;
+    this.getActiveWallHeights().delete(this.tileIdx(x, z));
+    this.state.dirty = true;
   }
 
   copyRegion(x: number, z: number, w: number, h: number): ClipboardRegion {
