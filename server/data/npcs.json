@@ -1,6 +1,8 @@
 [
   { "id": 1, "name": "Chicken", "health": 5, "attack": 1, "defence": 1, "strength": 1, "attackSpeed": 4, "respawnTime": 15, "aggressive": false, "wanderRange": 2,
     "lootTable": [{ "itemId": 1, "quantity": 1, "chance": 1.0 }, { "itemId": 11, "quantity": 1, "chance": 0.9 }, { "itemId": 19, "quantity": 3, "chance": 1.0 }] },
+  { "id": 10, "name": "Cow", "health": 10, "attack": 2, "defence": 2, "strength": 2, "attackSpeed": 5, "respawnTime": 20, "aggressive": false, "wanderRange": 3,
+    "lootTable": [{ "itemId": 1, "quantity": 1, "chance": 1.0 }, { "itemId": 11, "quantity": 1, "chance": 0.6 }] },
   { "id": 2, "name": "Rat", "health": 8, "attack": 2, "defence": 1, "strength": 2, "attackSpeed": 4, "respawnTime": 15, "aggressive": false, "wanderRange": 2,
     "lootTable": [{ "itemId": 1, "quantity": 1, "chance": 0.8 }, { "itemId": 14, "quantity": 1, "chance": 0.8 }, { "itemId": 10, "quantity": 3, "chance": 0.4 }] },
   { "id": 3, "name": "Goblin", "health": 15, "attack": 4, "defence": 3, "strength": 4, "attackSpeed": 4, "respawnTime": 20, "aggressive": false, "wanderRange": 3,

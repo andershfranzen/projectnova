@@ -478,3 +478,4 @@ console.log(`ProjectRS server running on http://localhost:${server.port}`);
 console.log(`Game WebSocket: ws://localhost:${server.port}${GAME_WS_PATH}`);
 console.log(`Chat WebSocket: ws://localhost:${server.port}${CHAT_WS_PATH}`);
 console.log(`World tick rate: ${600}ms — ${world.players.size} players online`);
+

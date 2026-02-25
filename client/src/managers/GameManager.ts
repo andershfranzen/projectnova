@@ -11,7 +11,7 @@ import { TransformNode } from '@babylonjs/core/Meshes/transformNode';
 import '@babylonjs/loaders/glTF';
 import { ChunkManager } from '../rendering/ChunkManager';
 import { GameCamera } from '../rendering/Camera';
-import { SpriteEntity, loadDirectionalSprites, type DirectionalSpriteSet } from '../rendering/SpriteEntity';
+import { SpriteEntity, loadDirectionalSprites, loadAnimationSprites, type DirectionalSpriteSet, type AnimationSpriteSet } from '../rendering/SpriteEntity';
 import { InputManager } from './InputManager';
 import { NetworkManager } from './NetworkManager';
 import { findPath } from '../rendering/Pathfinding';
@@ -32,19 +32,21 @@ const NPC_COLORS: Record<number, Color3> = {
   7: new Color3(0.6, 0.6, 0.65),  // Guard — silver
   8: new Color3(0.7, 0.5, 0.2),   // Shopkeeper — gold
   9: new Color3(0.15, 0.1, 0.2),  // Dark Knight — dark purple
+  10: new Color3(0.6, 0.4, 0.2),  // Cow — brown
 };
 
 const NPC_NAMES: Record<number, string> = {
   1: 'Chicken', 2: 'Rat', 3: 'Goblin', 4: 'Wolf',
   5: 'Skeleton', 6: 'Spider', 7: 'Guard', 8: 'Shopkeeper',
-  9: 'Dark Knight',
+  9: 'Dark Knight', 10: 'Cow',
 };
 
 const NPC_SIZES: Record<number, { w: number; h: number }> = {
-  1: { w: 0.5, h: 0.6 },  // Chicken (small)
-  2: { w: 0.5, h: 0.7 },  // Rat (small)
-  6: { w: 0.6, h: 0.5 },  // Spider (wide, short)
-  9: { w: 1.0, h: 1.8 },  // Dark Knight (big)
+  1: { w: 0.7, h: 0.85 },  // Chicken (small, ~half player height)
+  2: { w: 0.5, h: 0.7 },   // Rat (small)
+  6: { w: 0.6, h: 0.5 },   // Spider (wide, short)
+  9: { w: 1.0, h: 1.8 },   // Dark Knight (big)
+  10: { w: 1.6, h: 1.4 },  // Cow (wide, slightly shorter than player)
 };
 
 interface GroundItemData {
@@ -82,6 +84,9 @@ export class GameManager {
 
   // Combat follow (local player follows melee target)
   private combatTargetId: number = -1;
+  // Combat facing: track who each entity is targeting (from COMBAT_HIT events)
+  private npcCombatTargets: Map<number, number> = new Map();  // npcId -> playerId they're attacking
+  private remoteCombatTargets: Map<number, number> = new Map();  // remotePlayerId -> npcId they're attacking
 
   // Remote players
   private remotePlayers: Map<number, SpriteEntity> = new Map();
@@ -108,6 +113,10 @@ export class GameManager {
   private rockModelTemplate: TransformNode | null = null;
   private rockModelScale: number = 1;
   private playerSprites: DirectionalSpriteSet | null = null;
+  /** Per-NPC-defId directional sprite sets */
+  private npcSpriteSets: Map<number, DirectionalSpriteSet> = new Map();
+  /** Per-NPC-defId attack animation sprite sets */
+  private npcAttackAnims: Map<number, AnimationSpriteSet> = new Map();
   private isSkilling: boolean = false;
   private skillingObjectId: number = -1;
 
@@ -229,6 +238,7 @@ export class GameManager {
     this.loadTreeModels();
     this.loadRockModel();
     this.loadPlayerSprites();
+    this.loadNpcSprites();
 
     // Game loop
     let lastTime = performance.now();
@@ -464,6 +474,61 @@ export class GameManager {
     }
   }
 
+  /** NPC sprite config: defId → sprite folder path + optional attack animation */
+  private static readonly NPC_SPRITE_CONFIG: { defId: number; path: string; name: string; attackPath?: string; attackFrames?: number }[] = [
+    { defId: 1, path: '/sprites/chicken', name: 'chicken' },
+    { defId: 10, path: '/sprites/cow', name: 'cow', attackPath: '/sprites/cow/attack', attackFrames: 4 },
+  ];
+
+  private async loadNpcSprites(): Promise<void> {
+    for (const cfg of GameManager.NPC_SPRITE_CONFIG) {
+      try {
+        const sprites = await loadDirectionalSprites(this.scene, cfg.path, cfg.name);
+        this.npcSpriteSets.set(cfg.defId, sprites);
+        console.log(`NPC sprites loaded for ${cfg.name} (defId=${cfg.defId})`);
+        // Upgrade existing NPC sprites of this type
+        for (const [entityId, sprite] of this.npcSprites) {
+          if (this.npcDefs.get(entityId) === cfg.defId) {
+            sprite.setDirectionalSprites(sprites);
+          }
+        }
+      } catch (e) {
+        console.warn(`Failed to load NPC sprites for ${cfg.name}:`, e);
+      }
+
+      // Load attack animation if configured
+      if (cfg.attackPath && cfg.attackFrames) {
+        try {
+          const attackAnim = await loadAnimationSprites(this.scene, cfg.attackPath, cfg.name, cfg.attackFrames);
+          // Compute mesh scale so attack frames match idle sprite pixel density
+          const idleSprites = this.npcSpriteSets.get(cfg.defId);
+          if (idleSprites) {
+            const idleTex = idleSprites.materials[0]?.diffuseTexture;
+            const atkTex = attackAnim.materials[0]?.[0]?.diffuseTexture;
+            if (idleTex && atkTex) {
+              const idleSize = idleTex.getSize();
+              const atkSize = atkTex.getSize();
+              if (idleSize.width > 0 && idleSize.height > 0) {
+                attackAnim.meshScaleX = atkSize.width / idleSize.width;
+                attackAnim.meshScaleY = atkSize.height / idleSize.height;
+              }
+            }
+          }
+          this.npcAttackAnims.set(cfg.defId, attackAnim);
+          console.log(`Attack animation loaded for ${cfg.name} (${cfg.attackFrames} frames, scale ${attackAnim.meshScaleX.toFixed(2)}x${attackAnim.meshScaleY.toFixed(2)})`);
+          // Attach to existing NPC sprites of this type
+          for (const [entityId, sprite] of this.npcSprites) {
+            if (this.npcDefs.get(entityId) === cfg.defId) {
+              sprite.setAttackAnimation(attackAnim);
+            }
+          }
+        } catch (e) {
+          console.warn(`Failed to load attack animation for ${cfg.name}:`, e);
+        }
+      }
+    }
+  }
+
   private upgradeToDirectionalSprite(sprite: SpriteEntity): void {
     if (!this.playerSprites) return;
     sprite.setDirectionalSprites(this.playerSprites);
@@ -529,6 +594,8 @@ export class GameManager {
       this.localPlayer = new SpriteEntity(this.scene, {
         name: 'localPlayer',
         color: new Color3(0.2, 0.4, 0.9),
+        width: 1.0,
+        height: 1.7,
         label: this.username,
         labelColor: '#00ff00',
         directionalSprites: this.playerSprites ?? undefined,
@@ -561,6 +628,8 @@ export class GameManager {
         const sprite = new SpriteEntity(this.scene, {
           name: `player_${entityId}`,
           color: new Color3(0.8, 0.2, 0.2),
+          width: 1.6,
+          height: 2.8,
           label: playerName,
           labelColor: '#ffffff',
           directionalSprites: this.playerSprites ?? undefined,
@@ -588,6 +657,7 @@ export class GameManager {
         const color = NPC_COLORS[npcDefId] || new Color3(0.5, 0.5, 0.5);
         const name = NPC_NAMES[npcDefId] || `NPC${npcDefId}`;
         const size = NPC_SIZES[npcDefId] || { w: 0.8, h: 1.4 };
+        const npcSpriteSet = this.npcSpriteSets.get(npcDefId);
         const sprite = new SpriteEntity(this.scene, {
           name: `npc_${entityId}`,
           color,
@@ -595,8 +665,12 @@ export class GameManager {
           labelColor: '#ffff00',
           width: size.w,
           height: size.h,
+          directionalSprites: npcSpriteSet ?? undefined,
         });
         sprite.position = new Vector3(x, this.getHeight(x, z), z);
+        // Attach attack animation if available for this NPC type
+        const attackAnim = this.npcAttackAnims.get(npcDefId);
+        if (attackAnim) sprite.setAttackAnimation(attackAnim);
         this.npcSprites.set(entityId, sprite);
       }
 
@@ -647,6 +721,17 @@ export class GameManager {
         this.combatTargetId = -1;
       }
 
+      // Clean up combat facing targets
+      this.npcCombatTargets.delete(entityId);
+      this.remoteCombatTargets.delete(entityId);
+      // Also remove any entity that was targeting this dead entity
+      for (const [npcId, targetId] of this.npcCombatTargets) {
+        if (targetId === entityId) this.npcCombatTargets.delete(npcId);
+      }
+      for (const [playerId, targetId] of this.remoteCombatTargets) {
+        if (targetId === entityId) this.remoteCombatTargets.delete(playerId);
+      }
+
       const playerSprite = this.remotePlayers.get(entityId);
       if (playerSprite) {
         playerSprite.dispose();
@@ -667,11 +752,29 @@ export class GameManager {
     });
 
     this.network.on(ServerOpcode.COMBAT_HIT, (_op, v) => {
-      const [_attackerId, targetId, damage, targetHp, targetMaxHp] = v;
+      const [attackerId, targetId, damage, targetHp, targetMaxHp] = v;
       const targetSprite = this.npcSprites.get(targetId) || this.remotePlayers.get(targetId);
       if (targetSprite) {
         this.showHitSplat(targetSprite.position, damage);
       }
+
+      // Track combat targets for facing
+      if (this.npcSprites.has(attackerId)) {
+        // NPC attacking a player
+        this.npcCombatTargets.set(attackerId, targetId);
+      } else if (this.remotePlayers.has(attackerId)) {
+        // Remote player attacking an NPC
+        this.remoteCombatTargets.set(attackerId, targetId);
+      }
+
+      // Trigger attack animation on the attacker sprite
+      const attackerSprite = this.npcSprites.get(attackerId)
+        || this.remotePlayers.get(attackerId)
+        || (attackerId === this.localPlayerId ? this.localPlayer : null);
+      if (attackerSprite) {
+        attackerSprite.playAttackAnimation();
+      }
+
       if (targetId === this.localPlayerId && this.localPlayer) {
         this.showHitSplat(this.localPlayer.position, damage);
         this.playerHealth = targetHp;
@@ -1286,6 +1389,11 @@ export class GameManager {
     if (this.keysDown.has('w') || this.keysDown.has('arrowup')) cam.beta = Math.max(0.2, cam.beta - camSpeed);
     if (this.keysDown.has('s') || this.keysDown.has('arrowdown')) cam.beta = Math.min(Math.PI / 2.2, cam.beta + camSpeed);
 
+    // Update attack animations on all sprites
+    if (this.localPlayer) this.localPlayer.updateAnimation(dt);
+    for (const [, sprite] of this.remotePlayers) sprite.updateAnimation(dt);
+    for (const [, sprite] of this.npcSprites) sprite.updateAnimation(dt);
+
     // Update chunks around player
     this.chunkManager.updatePlayerPosition(this.playerX, this.playerZ);
 
@@ -1339,6 +1447,10 @@ export class GameManager {
         const dist = Math.hypot(dx, dz);
         const step = this.moveSpeed * dt;
 
+        // Update sprite direction based on movement + camera angle
+        const camPos = this.scene.activeCamera?.position;
+        if (camPos) this.localPlayer.updateMovementDirection(dx, dz, camPos);
+
         if (dist <= step) {
           this.playerX = target.x;
           this.playerZ = target.z;
@@ -1352,6 +1464,18 @@ export class GameManager {
       }
     }
 
+    // Face local player toward combat target when idle
+    if (this.localPlayer && this.path.length === 0 && this.combatTargetId >= 0) {
+      const camPos = this.scene.activeCamera?.position;
+      if (camPos) {
+        const npcTarget = this.npcTargets.get(this.combatTargetId);
+        const npcSprite = this.npcSprites.get(this.combatTargetId);
+        if (npcTarget && npcSprite) {
+          this.localPlayer.faceToward(npcSprite.position, camPos);
+        }
+      }
+    }
+
     // Interpolate remote players
     for (const [entityId, sprite] of this.remotePlayers) {
       const target = this.remoteTargets.get(entityId);
@@ -1361,10 +1485,22 @@ export class GameManager {
       const dz = target.z - c.z;
       const dist = Math.hypot(dx, dz);
       if (dist > 0.05) {
+        const camPos = this.scene.activeCamera?.position;
+        if (camPos) sprite.updateMovementDirection(dx, dz, camPos);
         const step = Math.min(4.0 * dt, dist);
         const nx = c.x + (dx / dist) * step;
         const nz = c.z + (dz / dist) * step;
         sprite.position = new Vector3(nx, this.getHeight(nx, nz), nz);
+      } else {
+        // Idle — face combat target if in combat
+        const combatTarget = this.remoteCombatTargets.get(entityId);
+        if (combatTarget !== undefined) {
+          const camPos = this.scene.activeCamera?.position;
+          if (camPos) {
+            const targetSprite = this.npcSprites.get(combatTarget);
+            if (targetSprite) sprite.faceToward(targetSprite.position, camPos);
+          }
+        }
       }
     }
 
@@ -1377,10 +1513,27 @@ export class GameManager {
       const dz = target.z - c.z;
       const dist = Math.hypot(dx, dz);
       if (dist > 0.05) {
+        const camPos = this.scene.activeCamera?.position;
+        if (camPos) sprite.updateMovementDirection(dx, dz, camPos);
         const step = Math.min(3.0 * dt, dist);
         const nx = c.x + (dx / dist) * step;
         const nz = c.z + (dz / dist) * step;
         sprite.position = new Vector3(nx, this.getHeight(nx, nz), nz);
+      } else {
+        // Idle — face combat target if in combat
+        const combatTarget = this.npcCombatTargets.get(entityId);
+        if (combatTarget !== undefined) {
+          const camPos = this.scene.activeCamera?.position;
+          if (camPos) {
+            // NPC's target could be local player or a remote player
+            if (combatTarget === this.localPlayerId && this.localPlayer) {
+              sprite.faceToward(this.localPlayer.position, camPos);
+            } else {
+              const targetSprite = this.remotePlayers.get(combatTarget);
+              if (targetSprite) sprite.faceToward(targetSprite.position, camPos);
+            }
+          }
+        }
       }
     }
 
@@ -1420,14 +1573,8 @@ export class GameManager {
       this.camera.followTarget(new Vector3(this.playerX, this.getHeight(this.playerX, this.playerZ), this.playerZ));
     }
 
-    // Update directional sprites based on camera angle
-    if (this.scene.activeCamera) {
-      const camPos = this.scene.activeCamera.position;
-      if (this.localPlayer) this.localPlayer.updateDirection(camPos);
-      for (const [, sprite] of this.remotePlayers) {
-        sprite.updateDirection(camPos);
-      }
-    }
+    // Note: player sprite directions are updated during movement interpolation above
+    // (based on movement direction, not camera angle)
 
     // Update all HTML overlay positions
     this.updateOverlayPositions();
