@@ -270,8 +270,8 @@ export class GameManager {
 
   /** Tree model config: defId → GLB file + target height */
   private static readonly TREE_MODEL_CONFIG: { defId: number; file: string; targetHeight: number }[] = [
-    { defId: 1, file: 'tree.glb', targetHeight: 2.0 },       // Tree (level 1)
-    { defId: 2, file: 'pinetree.glb', targetHeight: 2.5 },    // Oak Tree (level 15)
+    { defId: 1, file: 'pinetree.glb', targetHeight: 2.0 },    // Tree (level 1) — pine
+    { defId: 2, file: 'tree.glb', targetHeight: 2.5 },        // Oak Tree (level 15) — leafy oak
   ];
 
   private async loadTreeModels(): Promise<void> {
