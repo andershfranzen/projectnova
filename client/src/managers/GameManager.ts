@@ -903,9 +903,9 @@ export class GameManager {
     const target = this.npcTargets.get(npcEntityId);
     if (target) {
       const path = findPath(this.playerX, this.playerZ, target.x, target.z,
-        (x, z) => this.chunkManager.isBlocked(x, z),
+        (x, z) => this.currentFloor === 0 ? this.chunkManager.isBlocked(x, z) : this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor),
         this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
-        (fx, fz, tx, tz) => this.chunkManager.isWallBlocked(fx, fz, tx, tz));
+        (fx, fz, tx, tz) => this.currentFloor === 0 ? this.chunkManager.isWallBlocked(fx, fz, tx, tz) : this.chunkManager.isWallBlockedOnFloor(fx, fz, tx, tz, this.currentFloor));
       if (path.length > 1) {
         const last = path[path.length - 1];
         if (Math.floor(last.x) === Math.floor(target.x) && Math.floor(last.z) === Math.floor(target.z)) {
@@ -935,9 +935,9 @@ export class GameManager {
     const dist = Math.hypot(dx, dz);
     if (dist > 2.0) {
       const path = findPath(this.playerX, this.playerZ, data.x, data.z,
-        (x, z) => this.chunkManager.isBlocked(x, z),
+        (x, z) => this.currentFloor === 0 ? this.chunkManager.isBlocked(x, z) : this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor),
         this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
-        (fx, fz, tx, tz) => this.chunkManager.isWallBlocked(fx, fz, tx, tz));
+        (fx, fz, tx, tz) => this.currentFloor === 0 ? this.chunkManager.isWallBlocked(fx, fz, tx, tz) : this.chunkManager.isWallBlockedOnFloor(fx, fz, tx, tz, this.currentFloor));
       if (path.length > 1) {
         const last = path[path.length - 1];
         if (Math.floor(last.x) === Math.floor(data.x) && Math.floor(last.z) === Math.floor(data.z)) {
@@ -1054,9 +1054,9 @@ export class GameManager {
     this.combatTargetId = -1;
 
     const path = findPath(this.playerX, this.playerZ, worldX, worldZ,
-      (x, z) => this.chunkManager.isBlocked(x, z),
+      (x, z) => this.currentFloor === 0 ? this.chunkManager.isBlocked(x, z) : this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor),
       this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
-      (fx, fz, tx, tz) => this.chunkManager.isWallBlocked(fx, fz, tx, tz));
+      (fx, fz, tx, tz) => this.currentFloor === 0 ? this.chunkManager.isWallBlocked(fx, fz, tx, tz) : this.chunkManager.isWallBlockedOnFloor(fx, fz, tx, tz, this.currentFloor));
 
     if (path.length > 0) {
       this.path = path;
@@ -1155,9 +1155,9 @@ export class GameManager {
         if (dist > 1.5) {
           if (this.path.length === 0 || dist > 3) {
             const newPath = findPath(this.playerX, this.playerZ, npcTarget.x, npcTarget.z,
-              (x, z) => this.chunkManager.isBlocked(x, z),
+              (x, z) => this.currentFloor === 0 ? this.chunkManager.isBlocked(x, z) : this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor),
               this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
-              (fx, fz, tx, tz) => this.chunkManager.isWallBlocked(fx, fz, tx, tz));
+              (fx, fz, tx, tz) => this.currentFloor === 0 ? this.chunkManager.isWallBlocked(fx, fz, tx, tz) : this.chunkManager.isWallBlockedOnFloor(fx, fz, tx, tz, this.currentFloor));
             if (newPath.length > 1) {
               const last = newPath[newPath.length - 1];
               if (Math.floor(last.x) === Math.floor(npcTarget.x) && Math.floor(last.z) === Math.floor(npcTarget.z)) {

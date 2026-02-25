@@ -294,7 +294,8 @@ export class World {
     let prevX = player.position.x;
     let prevZ = player.position.y;
     for (const step of path) {
-      if (!map.isBlocked(step.x, step.z) && !map.isWallBlocked(prevX, prevZ, step.x, step.z)) {
+      const pFloor = player.currentFloor;
+      if ((pFloor === 0 ? !map.isBlocked(step.x, step.z) : !map.isTileBlockedOnFloor(Math.floor(step.x), Math.floor(step.z), pFloor)) && (pFloor === 0 ? !map.isWallBlocked(prevX, prevZ, step.x, step.z) : !map.isWallBlockedOnFloor(prevX, prevZ, step.x, step.z, pFloor))) {
         validPath.push(step);
         prevX = step.x;
         prevZ = step.z;
@@ -320,7 +321,7 @@ export class World {
     const dist = Math.sqrt(dx * dx + dz * dz);
     if (dist > 1.5) {
       const map = this.getPlayerMap(player);
-      const path = map.findPath(player.position.x, player.position.y, npc.position.x, npc.position.y);
+      const path = map.findPathOnFloor(player.position.x, player.position.y, npc.position.x, npc.position.y, player.currentFloor);
       if (path.length > 1) {
         player.moveQueue = path.slice(0, -1);
       } else {
@@ -392,7 +393,7 @@ export class World {
     if (dx > 2.0 || dz > 2.0) {
       // Walk toward the object first
       const map = this.getPlayerMap(player);
-      const path = map.findPath(player.position.x, player.position.y, obj.x, obj.z);
+      const path = map.findPathOnFloor(player.position.x, player.position.y, obj.x, obj.z, player.currentFloor);
       if (path.length > 1) {
         // Remove last step if it's on the object's tile
         const last = path[path.length - 1];

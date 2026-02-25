@@ -167,7 +167,7 @@ export class GameMap {
 
   /** Check if a tile is walkable on a specific floor */
   isTileBlockedOnFloor(x: number, z: number, floor: number): boolean {
-    if (floor === 0) return this.isTileBlocked(x, z);
+    if (floor === 0) return this.isBlocked(x, z);
     const layer = this.floorLayers.get(floor);
     if (!layer) return true; // no floor layer = can't walk
     // Must have a floor or tiles defined
@@ -297,18 +297,22 @@ export class GameMap {
 
   /** Get effective walking height at a position, accounting for floors and stairs */
   getEffectiveHeight(x: number, z: number): number {
+    return this.getEffectiveHeightOnFloor(x, z, 0);
+  }
+
+  /** Get effective walking height at a position on a specific floor */
+  getEffectiveHeightOnFloor(x: number, z: number, floor: number): number {
     const tx = Math.floor(x);
     const tz = Math.floor(z);
 
-    // Check for stair
-    const stair = this.getStair(tx, tz);
+    // Check for stair on this floor
+    const stair = this.getStairOnFloor(tx, tz, floor);
     if (stair) {
-      // Interpolate height based on position within tile along stair direction
-      const fx = x - tx; // 0-1 fractional position within tile
+      const fx = x - tx;
       const fz = z - tz;
       let t: number;
       switch (stair.direction) {
-        case 'N': t = 1 - fz; break; // walking north = decreasing z = going up
+        case 'N': t = 1 - fz; break;
         case 'S': t = fz; break;
         case 'E': t = fx; break;
         case 'W': t = 1 - fx; break;
@@ -316,11 +320,23 @@ export class GameMap {
       return stair.baseHeight + t * (stair.topHeight - stair.baseHeight);
     }
 
-    // Check for elevated floor
-    const floor = this.getFloorHeight(x, z);
-    if (floor !== null) return floor;
+    if (floor === 0) {
+      // Check for elevated floor
+      const floorH = this.getFloorHeight(x, z);
+      if (floorH !== null) return floorH;
+      // Default: terrain height
+      return this.getInterpolatedHeight(x, z);
+    }
 
-    // Default: terrain height
+    // Upper floor: check floors map
+    const layer = this.floorLayers.get(floor);
+    if (layer) {
+      const idx = tz * this.width + tx;
+      const floorH = layer.floors.get(idx);
+      if (floorH !== undefined) return floorH;
+    }
+
+    // No floor data on this level — fallback to terrain (shouldn't normally happen)
     return this.getInterpolatedHeight(x, z);
   }
 
@@ -499,6 +515,138 @@ export class GameMap {
         if (nx < 0 || nx >= w || nz < 0 || nz >= h) continue;
         if (this.isBlocked(nx, nz)) continue;
         if (this.isWallBlocked(current.x, current.z, nx, nz)) continue;
+
+        const isDiag = dx !== 0 && dz !== 0;
+        const g = current.g + (isDiag ? 1.414 : 1);
+
+        const existing = openMap.get(nk);
+        if (existing) {
+          if (g < existing.g) {
+            existing.g = g;
+            existing.f = g + existing.hv;
+            existing.parent = current;
+            bubbleUp(existing.heapIdx);
+          }
+          continue;
+        }
+
+        const nhv = heuristic(nx, nz);
+        const node: PNode = { x: nx, z: nz, g, hv: nhv, f: g + nhv, parent: current, heapIdx: 0 };
+        pushNode(node);
+        openMap.set(nk, node);
+      }
+    }
+    return [];
+  }
+
+  /** Find path on a specific floor. Floor 0 uses ground terrain, floors 1+ use floor layer data. */
+  findPathOnFloor(startX: number, startZ: number, goalX: number, goalZ: number, floor: number): { x: number; z: number }[] {
+    if (floor === 0) return this.findPath(startX, startZ, goalX, goalZ);
+
+    const sx = Math.floor(startX);
+    const sz = Math.floor(startZ);
+    const gx = Math.floor(goalX);
+    const gz = Math.floor(goalZ);
+
+    if (sx === gx && sz === gz) return [];
+    if (this.isTileBlockedOnFloor(gx, gz, floor)) return [];
+
+    const w = this.width;
+    const h = this.height;
+    const maxSteps = 800;
+
+    interface PNode { x: number; z: number; g: number; hv: number; f: number; parent: PNode | null; heapIdx: number }
+    const heap: PNode[] = [];
+    const openMap = new Map<number, PNode>();
+    const closed = new Set<number>();
+    const key = (x: number, z: number) => z * w + x;
+
+    const heuristic = (x: number, z: number) => {
+      const dx = Math.abs(x - gx);
+      const dz = Math.abs(z - gz);
+      return Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz);
+    };
+
+    const bubbleUp = (i: number) => {
+      const node = heap[i];
+      while (i > 0) {
+        const pi = (i - 1) >> 1;
+        const parent = heap[pi];
+        if (node.f >= parent.f) break;
+        heap[i] = parent; parent.heapIdx = i;
+        i = pi;
+      }
+      heap[i] = node; node.heapIdx = i;
+    };
+
+    const sinkDown = (i: number) => {
+      const len = heap.length;
+      const node = heap[i];
+      while (true) {
+        let sm = i;
+        const l = 2 * i + 1, r = 2 * i + 2;
+        if (l < len && heap[l].f < heap[sm].f) sm = l;
+        if (r < len && heap[r].f < heap[sm].f) sm = r;
+        if (sm === i) break;
+        heap[i] = heap[sm]; heap[i].heapIdx = i;
+        i = sm;
+      }
+      heap[i] = node; node.heapIdx = i;
+    };
+
+    const pushNode = (n: PNode) => { n.heapIdx = heap.length; heap.push(n); bubbleUp(heap.length - 1); };
+    const popNode = (): PNode => {
+      const top = heap[0];
+      const last = heap.pop()!;
+      if (heap.length > 0) { heap[0] = last; last.heapIdx = 0; sinkDown(0); }
+      return top;
+    };
+
+    const sh = heuristic(sx, sz);
+    const startNode: PNode = { x: sx, z: sz, g: 0, hv: sh, f: sh, parent: null, heapIdx: 0 };
+    pushNode(startNode);
+    openMap.set(key(sx, sz), startNode);
+
+    let steps = 0;
+    while (heap.length > 0 && steps < maxSteps) {
+      steps++;
+      const current = popNode();
+      const ck = key(current.x, current.z);
+      openMap.delete(ck);
+
+      if (current.x === gx && current.z === gz) {
+        const path: { x: number; z: number }[] = [];
+        let node: PNode | null = current;
+        while (node && !(node.x === sx && node.z === sz)) {
+          path.unshift({ x: node.x + 0.5, z: node.z + 0.5 });
+          node = node.parent;
+        }
+        return path;
+      }
+
+      closed.add(ck);
+
+      const dirs: [number, number][] = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+      const blocked = (x: number, z: number) => this.isTileBlockedOnFloor(x, z, floor);
+      const wallBlk = (fx: number, fz: number, tx: number, tz: number) => this.isWallBlockedOnFloor(fx, fz, tx, tz, floor);
+
+      const canW = !blocked(current.x - 1, current.z) && !wallBlk(current.x, current.z, current.x - 1, current.z);
+      const canE = !blocked(current.x + 1, current.z) && !wallBlk(current.x, current.z, current.x + 1, current.z);
+      const canN = !blocked(current.x, current.z - 1) && !wallBlk(current.x, current.z, current.x, current.z - 1);
+      const canS = !blocked(current.x, current.z + 1) && !wallBlk(current.x, current.z, current.x, current.z + 1);
+      if (canW && canN) dirs.push([-1, -1]);
+      if (canE && canN) dirs.push([1, -1]);
+      if (canW && canS) dirs.push([-1, 1]);
+      if (canE && canS) dirs.push([1, 1]);
+
+      for (const [dx, dz] of dirs) {
+        const nx = current.x + dx;
+        const nz = current.z + dz;
+        const nk = key(nx, nz);
+        if (closed.has(nk)) continue;
+        if (nx < 0 || nx >= w || nz < 0 || nz >= h) continue;
+        if (blocked(nx, nz)) continue;
+        if (wallBlk(current.x, current.z, nx, nz)) continue;
 
         const isDiag = dx !== 0 && dz !== 0;
         const g = current.g + (isDiag ? 1.414 : 1);

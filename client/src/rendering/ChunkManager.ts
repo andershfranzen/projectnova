@@ -4,7 +4,7 @@ import { Color3, Color4 } from '@babylonjs/core/Maths/math.color';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData';
 import { CHUNK_SIZE, CHUNK_LOAD_RADIUS, TILE_SIZE, TileType, BLOCKING_TILES, WATER_LEVEL, tileTypeFromRgb, WallEdge, DEFAULT_WALL_HEIGHT } from '@projectrs/shared';
-import type { MapMeta, WallsFile, StairData, RoofData } from '@projectrs/shared';
+import type { MapMeta, WallsFile, StairData, RoofData, FloorLayerData } from '@projectrs/shared';
 
 // Tile colors for vertex coloring
 const TILE_COLORS: Record<TileType, Color4> = {
@@ -17,13 +17,31 @@ const TILE_COLORS: Record<TileType, Color4> = {
   [TileType.WOOD]:  new Color4(0.45, 0.32, 0.18, 1),
 };
 
-interface ChunkMeshes {
-  ground: Mesh;
-  water: Mesh | null;
+/** Building meshes for a single floor layer within a chunk */
+interface FloorMeshSet {
   wall: Mesh | null;
   roof: Mesh | null;
   floor: Mesh | null;
   stairs: Mesh | null;
+}
+
+interface ChunkMeshes {
+  ground: Mesh;
+  water: Mesh | null;
+  wall: Mesh | null;      // floor 0 walls
+  roof: Mesh | null;      // floor 0 roofs
+  floor: Mesh | null;     // floor 0 floors
+  stairs: Mesh | null;    // floor 0 stairs
+  upperFloors: Map<number, FloorMeshSet>; // floor 1+ meshes
+}
+
+/** In-memory floor layer data */
+interface FloorLayerClientData {
+  walls: Map<number, number>;
+  wallHeights: Map<number, number>;
+  floors: Map<number, number>;
+  stairs: Map<number, StairData>;
+  roofs: Map<number, RoofData>;
 }
 
 /**
@@ -46,6 +64,10 @@ export class ChunkManager {
   private floorHeights: Map<number, number> = new Map(); // sparse: tile index -> floor height
   private stairData: Map<number, StairData> = new Map(); // sparse: tile index -> stair
   private roofData: Map<number, RoofData> = new Map(); // sparse: tile index -> roof
+
+  // Multi-floor layer data (floor 1+)
+  private floorLayerData: Map<number, FloorLayerClientData> = new Map();
+  private currentFloor: number = 0;
 
   // Active chunk meshes
   private chunks: Map<string, ChunkMeshes> = new Map();
@@ -139,6 +161,8 @@ export class ChunkManager {
     this.floorHeights.clear();
     this.stairData.clear();
     this.roofData.clear();
+    this.floorLayerData.clear();
+    this.currentFloor = 0;
     try {
       const wallsRes = await fetch(`/maps/${mapId}/walls.json${cacheBust}`);
       if (wallsRes.ok) {
@@ -176,6 +200,26 @@ export class ChunkManager {
           for (const [key, data] of Object.entries(wallsData.roofs)) {
             const idx = parseKey(key);
             if (idx !== null) this.roofData.set(idx, data);
+          }
+        }
+        // Load floor layers (floors 1+)
+        if (wallsData.floorLayers) {
+          for (const [floorStr, ld] of Object.entries(wallsData.floorLayers)) {
+            const floorIdx = parseInt(floorStr as string);
+            const layer: FloorLayerClientData = {
+              walls: new Map(),
+              wallHeights: new Map(),
+              floors: new Map(),
+              stairs: new Map(),
+              roofs: new Map(),
+            };
+            const ldd = ld as FloorLayerData;
+            if (ldd.walls) for (const [k, v] of Object.entries(ldd.walls)) { const i = parseKey(k); if (i !== null) layer.walls.set(i, v); }
+            if (ldd.wallHeights) for (const [k, v] of Object.entries(ldd.wallHeights)) { const i = parseKey(k); if (i !== null) layer.wallHeights.set(i, v); }
+            if (ldd.floors) for (const [k, v] of Object.entries(ldd.floors)) { const i = parseKey(k); if (i !== null) layer.floors.set(i, v); }
+            if (ldd.stairs) for (const [k, v] of Object.entries(ldd.stairs)) { const i = parseKey(k); if (i !== null) layer.stairs.set(i, v as StairData); }
+            if (ldd.roofs) for (const [k, v] of Object.entries(ldd.roofs)) { const i = parseKey(k); if (i !== null) layer.roofs.set(i, v as RoofData); }
+            this.floorLayerData.set(floorIdx, layer);
           }
         }
       }
@@ -250,6 +294,12 @@ export class ChunkManager {
         meshes.roof?.dispose();
         meshes.floor?.dispose();
         meshes.stairs?.dispose();
+        for (const [, floorSet] of meshes.upperFloors) {
+          floorSet.wall?.dispose();
+          floorSet.roof?.dispose();
+          floorSet.floor?.dispose();
+          floorSet.stairs?.dispose();
+        }
         this.chunks.delete(key);
       }
     }
@@ -270,15 +320,41 @@ export class ChunkManager {
     const endX = Math.min(startX + CHUNK_SIZE, this.mapWidth);
     const endZ = Math.min(startZ + CHUNK_SIZE, this.mapHeight);
 
-    // Ground mesh
+    // Ground mesh (always floor 0)
     const ground = this.buildGroundMesh(chunkX, chunkZ, startX, startZ, endX, endZ);
     const water = this.buildWaterMesh(chunkX, chunkZ, startX, startZ, endX, endZ);
+    // Floor 0 building meshes
     const wall = this.buildWallMesh(chunkX, chunkZ, startX, startZ, endX, endZ);
     const roof = this.buildRoofMesh(chunkX, chunkZ, startX, startZ, endX, endZ);
     const floor = this.buildFloorMesh(chunkX, chunkZ, startX, startZ, endX, endZ);
     const stairs = this.buildStairMesh(chunkX, chunkZ, startX, startZ, endX, endZ);
 
-    return { ground, water, wall, roof, floor, stairs };
+    // Upper floor meshes
+    const upperFloors = new Map<number, FloorMeshSet>();
+    for (const [floorIdx, layerData] of this.floorLayerData) {
+      const floorSet = this.buildFloorLayerMeshes(chunkX, chunkZ, startX, startZ, endX, endZ, floorIdx, layerData);
+      if (floorSet) {
+        upperFloors.set(floorIdx, floorSet);
+        // Apply visibility based on current floor
+        this.setFloorMeshSetVisibility(floorSet, floorIdx);
+      }
+    }
+
+    return { ground, water, wall, roof, floor, stairs, upperFloors };
+  }
+
+  /** Build wall/floor/stair/roof meshes for an upper floor layer */
+  private buildFloorLayerMeshes(
+    chunkX: number, chunkZ: number,
+    startX: number, startZ: number, endX: number, endZ: number,
+    floorIdx: number, layer: FloorLayerClientData
+  ): FloorMeshSet | null {
+    const wall = this.buildWallMeshForLayer(chunkX, chunkZ, startX, startZ, endX, endZ, floorIdx, layer);
+    const roof = this.buildRoofMeshForLayer(chunkX, chunkZ, startX, startZ, endX, endZ, floorIdx, layer);
+    const floor = this.buildFloorMeshForLayer(chunkX, chunkZ, startX, startZ, endX, endZ, floorIdx, layer);
+    const stairs = this.buildStairMeshForLayer(chunkX, chunkZ, startX, startZ, endX, endZ, floorIdx, layer);
+    if (!wall && !roof && !floor && !stairs) return null;
+    return { wall, roof, floor, stairs };
   }
 
   private buildGroundMesh(chunkX: number, chunkZ: number, startX: number, startZ: number, endX: number, endZ: number): Mesh {
@@ -793,6 +869,343 @@ export class ChunkManager {
     return mesh;
   }
 
+  // --- Upper floor layer mesh builders ---
+
+  private buildWallMeshForLayer(chunkX: number, chunkZ: number, startX: number, startZ: number, endX: number, endZ: number, floorIdx: number, layer: FloorLayerClientData): Mesh | null {
+    const positions: number[] = [];
+    const indices: number[] = [];
+    const normals: number[] = [];
+    const colors: number[] = [];
+    let vertexIndex = 0;
+    let hasWalls = false;
+    const WALL_THICKNESS = 0.1;
+    const cr = 0.35, cg = 0.30, cb = 0.30;
+
+    for (let x = startX; x < endX; x++) {
+      for (let z = startZ; z < endZ; z++) {
+        const tileIdx = z * this.mapWidth + x;
+        const mask = layer.walls.get(tileIdx) ?? 0;
+        if (mask === 0) continue;
+        hasWalls = true;
+
+        const wallH = layer.wallHeights.get(tileIdx) ?? DEFAULT_WALL_HEIGHT;
+        const floorH = layer.floors.get(tileIdx) ?? 0;
+
+        const x0 = x * TILE_SIZE;
+        const x1 = (x + 1) * TILE_SIZE;
+        const z0 = z * TILE_SIZE;
+        const z1 = (z + 1) * TILE_SIZE;
+
+        // Use floor height as base for upper floor walls
+        const baseY = floorH;
+
+        if (mask & WallEdge.N) {
+          const yL = baseY, yR = baseY, ytL = baseY + wallH, ytR = baseY + wallH;
+          positions.push(x0, yL, z0, x0, ytL, z0, x1, ytR, z0, x1, yR, z0);
+          for (let i = 0; i < 4; i++) { normals.push(0, 0, -1); colors.push(cr, cg, cb, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          const zb = z0 + WALL_THICKNESS;
+          positions.push(x1, yR, zb, x1, ytR, zb, x0, ytL, zb, x0, yL, zb);
+          for (let i = 0; i < 4; i++) { normals.push(0, 0, 1); colors.push(cr - 0.05, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          positions.push(x0, ytL, z0, x0, ytL, zb, x1, ytR, zb, x1, ytR, z0);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+        if (mask & WallEdge.S) {
+          const yL = baseY, yR = baseY, ytL = baseY + wallH, ytR = baseY + wallH;
+          const zf = z1 - WALL_THICKNESS;
+          positions.push(x1, yR, z1, x1, ytR, z1, x0, ytL, z1, x0, yL, z1);
+          for (let i = 0; i < 4; i++) { normals.push(0, 0, 1); colors.push(cr, cg, cb, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          positions.push(x0, yL, zf, x0, ytL, zf, x1, ytR, zf, x1, yR, zf);
+          for (let i = 0; i < 4; i++) { normals.push(0, 0, -1); colors.push(cr - 0.05, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          positions.push(x0, ytL, zf, x0, ytL, z1, x1, ytR, z1, x1, ytR, zf);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+        if (mask & WallEdge.E) {
+          const yT = baseY, yB = baseY, ytT = baseY + wallH, ytB = baseY + wallH;
+          positions.push(x1, yT, z0, x1, ytT, z0, x1, ytB, z1, x1, yB, z1);
+          for (let i = 0; i < 4; i++) { normals.push(1, 0, 0); colors.push(cr - 0.03, cg - 0.03, cb - 0.03, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          const xb = x1 - WALL_THICKNESS;
+          positions.push(xb, yB, z1, xb, ytB, z1, xb, ytT, z0, xb, yT, z0);
+          for (let i = 0; i < 4; i++) { normals.push(-1, 0, 0); colors.push(cr - 0.05, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          positions.push(xb, ytT, z0, x1, ytT, z0, x1, ytB, z1, xb, ytB, z1);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+        if (mask & WallEdge.W) {
+          const yT = baseY, yB = baseY, ytT = baseY + wallH, ytB = baseY + wallH;
+          positions.push(x0, yB, z1, x0, ytB, z1, x0, ytT, z0, x0, yT, z0);
+          for (let i = 0; i < 4; i++) { normals.push(-1, 0, 0); colors.push(cr - 0.03, cg - 0.03, cb - 0.03, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          const xb = x0 + WALL_THICKNESS;
+          positions.push(xb, yT, z0, xb, ytT, z0, xb, ytB, z1, xb, yB, z1);
+          for (let i = 0; i < 4; i++) { normals.push(1, 0, 0); colors.push(cr - 0.05, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          positions.push(x0, ytT, z0, xb, ytT, z0, xb, ytB, z1, x0, ytB, z1);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+      }
+    }
+    if (!hasWalls) return null;
+    const mesh = new Mesh(`wall_f${floorIdx}_${chunkX}_${chunkZ}`, this.scene);
+    const vertexData = new VertexData();
+    vertexData.positions = positions;
+    vertexData.indices = indices;
+    vertexData.normals = normals;
+    vertexData.colors = colors;
+    vertexData.applyToMesh(mesh);
+    mesh.material = this.wallMat;
+    mesh.hasVertexAlpha = false;
+    mesh.isPickable = false;
+    return mesh;
+  }
+
+  private buildFloorMeshForLayer(chunkX: number, chunkZ: number, startX: number, startZ: number, endX: number, endZ: number, floorIdx: number, layer: FloorLayerClientData): Mesh | null {
+    const positions: number[] = [];
+    const indices: number[] = [];
+    const normals: number[] = [];
+    const colors: number[] = [];
+    let vertexIndex = 0;
+    let hasFloor = false;
+
+    for (let x = startX; x < endX; x++) {
+      for (let z = startZ; z < endZ; z++) {
+        const tileIdx = z * this.mapWidth + x;
+        const floorH = layer.floors.get(tileIdx);
+        if (floorH === undefined) continue;
+        hasFloor = true;
+
+        const x0 = x * TILE_SIZE;
+        const x1 = (x + 1) * TILE_SIZE;
+        const z0 = z * TILE_SIZE;
+        const z1 = (z + 1) * TILE_SIZE;
+        const baseColor = TILE_COLORS[TileType.WOOD];
+
+        // Top face
+        positions.push(x0, floorH, z0, x1, floorH, z0, x1, floorH, z1, x0, floorH, z1);
+        for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(baseColor.r, baseColor.g, baseColor.b, 1); }
+        indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+        vertexIndex += 4;
+        // Bottom face
+        positions.push(x0, floorH, z1, x1, floorH, z1, x1, floorH, z0, x0, floorH, z0);
+        for (let i = 0; i < 4; i++) { normals.push(0, -1, 0); colors.push(baseColor.r - 0.1, baseColor.g - 0.1, baseColor.b - 0.1, 1); }
+        indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+        vertexIndex += 4;
+
+        // Edge faces
+        const edgeColor = { r: baseColor.r - 0.08, g: baseColor.g - 0.08, b: baseColor.b - 0.08 };
+        const edgeBottom = floorH - 0.5; // small edge height for upper floors
+        const neighborFloor = (nx: number, nz: number) => layer.floors.get(nz * this.mapWidth + nx);
+
+        if (neighborFloor(x, z - 1) !== floorH) {
+          positions.push(x0, edgeBottom, z0, x0, floorH, z0, x1, floorH, z0, x1, edgeBottom, z0);
+          for (let i = 0; i < 4; i++) { normals.push(0, 0, -1); colors.push(edgeColor.r, edgeColor.g, edgeColor.b, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+        if (neighborFloor(x, z + 1) !== floorH) {
+          positions.push(x1, edgeBottom, z1, x1, floorH, z1, x0, floorH, z1, x0, edgeBottom, z1);
+          for (let i = 0; i < 4; i++) { normals.push(0, 0, 1); colors.push(edgeColor.r, edgeColor.g, edgeColor.b, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+        if (neighborFloor(x + 1, z) !== floorH) {
+          positions.push(x1, edgeBottom, z0, x1, floorH, z0, x1, floorH, z1, x1, edgeBottom, z1);
+          for (let i = 0; i < 4; i++) { normals.push(1, 0, 0); colors.push(edgeColor.r, edgeColor.g, edgeColor.b, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+        if (neighborFloor(x - 1, z) !== floorH) {
+          positions.push(x0, edgeBottom, z1, x0, floorH, z1, x0, floorH, z0, x0, edgeBottom, z0);
+          for (let i = 0; i < 4; i++) { normals.push(-1, 0, 0); colors.push(edgeColor.r, edgeColor.g, edgeColor.b, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+      }
+    }
+    if (!hasFloor) return null;
+    const mesh = new Mesh(`floor_f${floorIdx}_${chunkX}_${chunkZ}`, this.scene);
+    const vertexData = new VertexData();
+    vertexData.positions = positions;
+    vertexData.indices = indices;
+    vertexData.normals = normals;
+    vertexData.colors = colors;
+    vertexData.applyToMesh(mesh);
+    mesh.material = this.floorMat;
+    mesh.hasVertexAlpha = false;
+    mesh.isPickable = true;
+    return mesh;
+  }
+
+  private buildStairMeshForLayer(chunkX: number, chunkZ: number, startX: number, startZ: number, endX: number, endZ: number, floorIdx: number, layer: FloorLayerClientData): Mesh | null {
+    const positions: number[] = [];
+    const indices: number[] = [];
+    const normals: number[] = [];
+    const colors: number[] = [];
+    let vertexIndex = 0;
+    let hasStairs = false;
+    const STEPS = 4;
+    const cr = 0.50, cg = 0.48, cb = 0.45;
+
+    for (let x = startX; x < endX; x++) {
+      for (let z = startZ; z < endZ; z++) {
+        const tileIdx = z * this.mapWidth + x;
+        const stair = layer.stairs.get(tileIdx);
+        if (!stair) continue;
+        hasStairs = true;
+
+        const x0 = x * TILE_SIZE;
+        const x1 = (x + 1) * TILE_SIZE;
+        const z0 = z * TILE_SIZE;
+        const z1 = (z + 1) * TILE_SIZE;
+        const heightDiff = stair.topHeight - stair.baseHeight;
+        const stepH = heightDiff / STEPS;
+
+        for (let s = 0; s < STEPS; s++) {
+          const t0 = s / STEPS;
+          const t1 = (s + 1) / STEPS;
+          const y0 = stair.baseHeight + s * stepH;
+          const y1 = stair.baseHeight + (s + 1) * stepH;
+          let sx0: number, sx1: number, sz0: number, sz1: number;
+          let faceNormal: [number, number, number];
+          switch (stair.direction) {
+            case 'N': sx0 = x0; sx1 = x1; sz0 = z1 - t1 * (z1 - z0); sz1 = z1 - t0 * (z1 - z0); faceNormal = [0, 0, 1]; break;
+            case 'S': sx0 = x0; sx1 = x1; sz0 = z0 + t0 * (z1 - z0); sz1 = z0 + t1 * (z1 - z0); faceNormal = [0, 0, -1]; break;
+            case 'E': sz0 = z0; sz1 = z1; sx0 = x0 + t0 * (x1 - x0); sx1 = x0 + t1 * (x1 - x0); faceNormal = [-1, 0, 0]; break;
+            case 'W': sz0 = z0; sz1 = z1; sx0 = x1 - t1 * (x1 - x0); sx1 = x1 - t0 * (x1 - x0); faceNormal = [1, 0, 0]; break;
+          }
+          // Step top
+          positions.push(sx0!, y1, sz0!, sx1!, y1, sz0!, sx1!, y1, sz1!, sx0!, y1, sz1!);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr, cg, cb, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          // Step riser
+          if (stair.direction === 'N' || stair.direction === 'S') {
+            const fz = stair.direction === 'N' ? sz1! : sz0!;
+            positions.push(sx0!, y0, fz, sx0!, y1, fz, sx1!, y1, fz, sx1!, y0, fz);
+          } else {
+            const fx = stair.direction === 'W' ? sx1! : sx0!;
+            positions.push(fx, y0, sz0!, fx, y1, sz0!, fx, y1, sz1!, fx, y0, sz1!);
+          }
+          for (let i = 0; i < 4; i++) { normals.push(faceNormal![0], faceNormal![1], faceNormal![2]); colors.push(cr - 0.08, cg - 0.08, cb - 0.08, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+      }
+    }
+    if (!hasStairs) return null;
+    const mesh = new Mesh(`stairs_f${floorIdx}_${chunkX}_${chunkZ}`, this.scene);
+    const vertexData = new VertexData();
+    vertexData.positions = positions;
+    vertexData.indices = indices;
+    vertexData.normals = normals;
+    vertexData.colors = colors;
+    vertexData.applyToMesh(mesh);
+    mesh.material = this.stairMat;
+    mesh.hasVertexAlpha = false;
+    mesh.isPickable = true;
+    return mesh;
+  }
+
+  private buildRoofMeshForLayer(chunkX: number, chunkZ: number, startX: number, startZ: number, endX: number, endZ: number, floorIdx: number, layer: FloorLayerClientData): Mesh | null {
+    const positions: number[] = [];
+    const indices: number[] = [];
+    const normals: number[] = [];
+    const colors: number[] = [];
+    let vertexIndex = 0;
+    let hasRoof = false;
+    const cr = 0.45, cg = 0.25, cb = 0.15;
+
+    for (let x = startX; x < endX; x++) {
+      for (let z = startZ; z < endZ; z++) {
+        const tileIdx = z * this.mapWidth + x;
+        const roof = layer.roofs.get(tileIdx);
+        if (!roof) continue;
+        hasRoof = true;
+
+        const x0 = x * TILE_SIZE;
+        const x1 = (x + 1) * TILE_SIZE;
+        const z0 = z * TILE_SIZE;
+        const z1 = (z + 1) * TILE_SIZE;
+        const baseY = roof.height;
+
+        if (roof.style === 'flat') {
+          positions.push(x0, baseY, z0, x1, baseY, z0, x1, baseY, z1, x0, baseY, z1);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr, cg, cb, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          positions.push(x0, baseY, z1, x1, baseY, z1, x1, baseY, z0, x0, baseY, z0);
+          for (let i = 0; i < 4; i++) { normals.push(0, -1, 0); colors.push(cr - 0.1, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        } else {
+          const peak = baseY + (roof.peakHeight ?? 0.6);
+          const mx = (x0 + x1) / 2;
+          const mz = (z0 + z1) / 2;
+          if (roof.style === 'peaked_ew') {
+            positions.push(x0, baseY, z0, x1, baseY, z0, x1, peak, mz, x0, peak, mz);
+            for (let i = 0; i < 4; i++) { normals.push(0, 0.7, -0.7); colors.push(cr, cg, cb, 1); }
+            indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+            vertexIndex += 4;
+            positions.push(x0, peak, mz, x1, peak, mz, x1, baseY, z1, x0, baseY, z1);
+            for (let i = 0; i < 4; i++) { normals.push(0, 0.7, 0.7); colors.push(cr - 0.05, cg - 0.03, cb - 0.03, 1); }
+            indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+            vertexIndex += 4;
+          } else {
+            positions.push(x0, baseY, z0, x0, baseY, z1, mx, peak, z1, mx, peak, z0);
+            for (let i = 0; i < 4; i++) { normals.push(-0.7, 0.7, 0); colors.push(cr, cg, cb, 1); }
+            indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+            vertexIndex += 4;
+            positions.push(mx, peak, z0, mx, peak, z1, x1, baseY, z1, x1, baseY, z0);
+            for (let i = 0; i < 4; i++) { normals.push(0.7, 0.7, 0); colors.push(cr - 0.05, cg - 0.03, cb - 0.03, 1); }
+            indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+            vertexIndex += 4;
+          }
+        }
+      }
+    }
+    if (!hasRoof) return null;
+    const mesh = new Mesh(`roof_f${floorIdx}_${chunkX}_${chunkZ}`, this.scene);
+    const vertexData = new VertexData();
+    vertexData.positions = positions;
+    vertexData.indices = indices;
+    vertexData.normals = normals;
+    vertexData.colors = colors;
+    vertexData.applyToMesh(mesh);
+    mesh.material = this.roofMat;
+    mesh.hasVertexAlpha = false;
+    mesh.isPickable = false;
+    return mesh;
+  }
+
+  /** Set visibility of a floor mesh set based on current floor */
+  private setFloorMeshSetVisibility(set: FloorMeshSet, floorIdx: number): void {
+    const visible = floorIdx <= this.currentFloor;
+    if (set.wall) set.wall.setEnabled(visible);
+    if (set.roof) set.roof.setEnabled(floorIdx > this.currentFloor); // roofs only visible when above current floor
+    if (set.floor) set.floor.setEnabled(visible);
+    if (set.stairs) set.stairs.setEnabled(visible);
+  }
+
   // --- Public query methods (used by game logic) ---
 
   getVertexHeight(vx: number, vz: number): number {
@@ -819,33 +1232,56 @@ export class ChunkManager {
     return h0 * (1 - fz) + h1 * fz;
   }
 
-  /** Get effective walking height, accounting for floors and stairs */
-  getEffectiveHeight(x: number, z: number): number {
+  /** Get effective walking height, accounting for floors, stairs, and current floor */
+  getEffectiveHeight(x: number, z: number, floor?: number): number {
+    const activeFloor = floor ?? this.currentFloor;
     const tx = Math.floor(x);
     const tz = Math.floor(z);
     if (tx < 0 || tx >= this.mapWidth || tz < 0 || tz >= this.mapHeight) return 0;
     const tileIdx = tz * this.mapWidth + tx;
 
-    // Check stairs first
-    const stair = this.stairData.get(tileIdx);
-    if (stair) {
-      const fx = x - tx;
-      const fz = z - tz;
-      let t: number;
-      switch (stair.direction) {
-        case 'N': t = 1 - fz; break;
-        case 'S': t = fz; break;
-        case 'E': t = fx; break;
-        case 'W': t = 1 - fx; break;
+    if (activeFloor === 0) {
+      // Check stairs first
+      const stair = this.stairData.get(tileIdx);
+      if (stair) {
+        const fx = x - tx;
+        const fz = z - tz;
+        let t: number;
+        switch (stair.direction) {
+          case 'N': t = 1 - fz; break;
+          case 'S': t = fz; break;
+          case 'E': t = fx; break;
+          case 'W': t = 1 - fx; break;
+        }
+        return stair.baseHeight + t * (stair.topHeight - stair.baseHeight);
       }
-      return stair.baseHeight + t * (stair.topHeight - stair.baseHeight);
+      // Check elevated floor
+      const floorH = this.floorHeights.get(tileIdx);
+      if (floorH !== undefined) return floorH;
+      // Default terrain
+      return this.getInterpolatedHeight(x, z);
     }
 
-    // Check elevated floor
-    const floorH = this.floorHeights.get(tileIdx);
-    if (floorH !== undefined) return floorH;
+    // Upper floor
+    const layer = this.floorLayerData.get(activeFloor);
+    if (layer) {
+      const stair = layer.stairs.get(tileIdx);
+      if (stair) {
+        const fx = x - tx;
+        const fz = z - tz;
+        let t: number;
+        switch (stair.direction) {
+          case 'N': t = 1 - fz; break;
+          case 'S': t = fz; break;
+          case 'E': t = fx; break;
+          case 'W': t = 1 - fx; break;
+        }
+        return stair.baseHeight + t * (stair.topHeight - stair.baseHeight);
+      }
+      const floorH = layer.floors.get(tileIdx);
+      if (floorH !== undefined) return floorH;
+    }
 
-    // Default terrain
     return this.getInterpolatedHeight(x, z);
   }
 
@@ -881,6 +1317,42 @@ export class ChunkManager {
     if (!this.walls) return 0;
     if (x < 0 || x >= this.mapWidth || z < 0 || z >= this.mapHeight) return 0;
     return this.walls[z * this.mapWidth + x];
+  }
+
+  /** Check if tile is blocked on the current floor */
+  isBlockedOnFloor(x: number, z: number, floor: number): boolean {
+    if (floor === 0) return this.isBlocked(x, z);
+    const layer = this.floorLayerData.get(floor);
+    if (!layer) return true;
+    const tx = Math.floor(x);
+    const tz = Math.floor(z);
+    if (tx < 0 || tx >= this.mapWidth || tz < 0 || tz >= this.mapHeight) return true;
+    const idx = tz * this.mapWidth + tx;
+    return !layer.floors.has(idx) && !layer.stairs.has(idx);
+  }
+
+  /** Check wall blocking on a specific floor */
+  isWallBlockedOnFloor(fromX: number, fromZ: number, toX: number, toZ: number, floor: number): boolean {
+    if (floor === 0) return this.isWallBlocked(fromX, fromZ, toX, toZ);
+    const layer = this.floorLayerData.get(floor);
+    if (!layer) return false;
+    const fx = Math.floor(fromX);
+    const fz = Math.floor(fromZ);
+    const tx = Math.floor(toX);
+    const tz = Math.floor(toZ);
+    const dx = tx - fx;
+    const dz = tz - fz;
+    const getW = (x: number, z: number) => layer.walls.get(z * this.mapWidth + x) ?? 0;
+
+    if (dx === 0 && dz === -1) return (getW(fx, fz) & WallEdge.N) !== 0;
+    if (dx === 1 && dz === 0) return (getW(fx, fz) & WallEdge.E) !== 0;
+    if (dx === 0 && dz === 1) return (getW(fx, fz) & WallEdge.S) !== 0;
+    if (dx === -1 && dz === 0) return (getW(fx, fz) & WallEdge.W) !== 0;
+    if (dx === 1 && dz === -1) return (getW(fx, fz) & WallEdge.N) !== 0 || (getW(fx, fz) & WallEdge.E) !== 0 || (getW(tx, tz) & WallEdge.S) !== 0 || (getW(tx, tz) & WallEdge.W) !== 0;
+    if (dx === -1 && dz === -1) return (getW(fx, fz) & WallEdge.N) !== 0 || (getW(fx, fz) & WallEdge.W) !== 0 || (getW(tx, tz) & WallEdge.S) !== 0 || (getW(tx, tz) & WallEdge.E) !== 0;
+    if (dx === 1 && dz === 1) return (getW(fx, fz) & WallEdge.S) !== 0 || (getW(fx, fz) & WallEdge.E) !== 0 || (getW(tx, tz) & WallEdge.N) !== 0 || (getW(tx, tz) & WallEdge.W) !== 0;
+    if (dx === -1 && dz === 1) return (getW(fx, fz) & WallEdge.S) !== 0 || (getW(fx, fz) & WallEdge.W) !== 0 || (getW(tx, tz) & WallEdge.N) !== 0 || (getW(tx, tz) & WallEdge.E) !== 0;
+    return false;
   }
 
   isWallBlocked(fromX: number, fromZ: number, toX: number, toZ: number): boolean {
@@ -947,10 +1419,25 @@ export class ChunkManager {
     return meshes;
   }
 
-  /** Set the active floor for multi-floor rendering (placeholder for Phase 4 culling) */
+  /** Set the active floor for multi-floor rendering */
   setCurrentFloor(floor: number): void {
-    // TODO: Phase 4 — hide floors above current, dim floors below
+    if (floor === this.currentFloor) return;
+    this.currentFloor = floor;
     console.log(`[ChunkManager] Current floor set to ${floor}`);
+
+    // Update visibility of floor 0 building meshes
+    // Floor 0 roofs: only visible when player is on floor 0 or below
+    for (const [, chunk] of this.chunks) {
+      if (chunk.roof) chunk.roof.setEnabled(floor === 0);
+      // Upper floor meshes
+      for (const [floorIdx, meshSet] of chunk.upperFloors) {
+        this.setFloorMeshSetVisibility(meshSet, floorIdx);
+      }
+    }
+  }
+
+  getCurrentFloor(): number {
+    return this.currentFloor;
   }
 
   disposeAll(): void {
@@ -961,6 +1448,12 @@ export class ChunkManager {
       meshes.roof?.dispose();
       meshes.floor?.dispose();
       meshes.stairs?.dispose();
+      for (const [, floorSet] of meshes.upperFloors) {
+        floorSet.wall?.dispose();
+        floorSet.roof?.dispose();
+        floorSet.floor?.dispose();
+        floorSet.stairs?.dispose();
+      }
     }
     this.chunks.clear();
     this.heights = null;
@@ -970,6 +1463,8 @@ export class ChunkManager {
     this.floorHeights.clear();
     this.stairData.clear();
     this.roofData.clear();
+    this.floorLayerData.clear();
+    this.currentFloor = 0;
     this.loaded = false;
     this.lastChunkX = -999;
     this.lastChunkZ = -999;
