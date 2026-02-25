@@ -353,6 +353,20 @@ export class GameManager {
         sprite.position = new Vector3(data.x, h, data.z);
       }
     }
+    // Reposition NPCs
+    for (const [entityId, sprite] of this.npcSprites) {
+      const target = this.npcTargets.get(entityId);
+      if (target) {
+        sprite.position = new Vector3(target.x, this.getHeight(target.x, target.z), target.z);
+      }
+    }
+    // Reposition remote players
+    for (const [entityId, sprite] of this.remotePlayers) {
+      const target = this.remoteTargets.get(entityId);
+      if (target) {
+        sprite.position = new Vector3(target.x, this.getHeight(target.x, target.z), target.z);
+      }
+    }
     // Also reposition ground items
     for (const [groundItemId, item] of this.groundItems) {
       const sprite = this.groundItemSprites.get(groundItemId);
