@@ -219,6 +219,7 @@ export class GameManager {
     // Load overworld map, object definitions, and tree 3D model
     this.chunkManager.loadMap('overworld').then(() => {
       this.applyFog();
+      this.repositionWorldObjects();
     });
     this.loadObjectDefs();
     this.loadTreeModel();
@@ -336,6 +337,32 @@ export class GameManager {
         this.worldObjectSprites.delete(objectEntityId);
       }
       this.createTreeModel(objectEntityId, data.defId, data.x, data.z, data.depleted);
+    }
+  }
+
+  /** Reposition all world objects/models after heightmap loads (fixes race condition) */
+  private repositionWorldObjects(): void {
+    for (const [objectEntityId, data] of this.worldObjectDefs) {
+      const h = this.getHeight(data.x, data.z);
+      const model = this.worldObjectModels.get(objectEntityId);
+      if (model) {
+        model.position.y = h;
+      }
+      const sprite = this.worldObjectSprites.get(objectEntityId);
+      if (sprite) {
+        sprite.position = new Vector3(data.x, h, data.z);
+      }
+    }
+    // Also reposition ground items
+    for (const [groundItemId, item] of this.groundItems) {
+      const sprite = this.groundItemSprites.get(groundItemId);
+      if (sprite) {
+        sprite.position = new Vector3(item.x, this.getHeight(item.x, item.z), item.z);
+      }
+    }
+    // Reposition local player
+    if (this.localPlayer) {
+      this.localPlayer.position = new Vector3(this.playerX, this.getHeight(this.playerX, this.playerZ), this.playerZ);
     }
   }
 
@@ -698,6 +725,9 @@ export class GameManager {
     if (this.localPlayer) {
       this.localPlayer.position = new Vector3(this.playerX, this.getHeight(this.playerX, this.playerZ), this.playerZ);
     }
+
+    // Reposition any entities that arrived before map finished loading
+    this.repositionWorldObjects();
 
     if (this.chatPanel) {
       this.chatPanel.addSystemMessage(`Entered ${this.chunkManager.getMeta()?.name || mapId}.`, '#0f0');
