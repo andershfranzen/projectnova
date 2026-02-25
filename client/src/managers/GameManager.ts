@@ -105,6 +105,8 @@ export class GameManager {
   private objectDefsCache: Map<number, WorldObjectDef> = new Map();
   private treeModelTemplate: TransformNode | null = null;
   private treeModelScale: number = 1;
+  private rockModelTemplate: TransformNode | null = null;
+  private rockModelScale: number = 1;
   private isSkilling: boolean = false;
   private skillingObjectId: number = -1;
 
@@ -224,6 +226,7 @@ export class GameManager {
     });
     this.loadObjectDefs();
     this.loadTreeModel();
+    this.loadRockModel();
 
     // Game loop
     let lastTime = performance.now();
@@ -338,6 +341,107 @@ export class GameManager {
         this.worldObjectSprites.delete(objectEntityId);
       }
       this.createTreeModel(objectEntityId, data.defId, data.x, data.z, data.depleted);
+    }
+  }
+
+  /** Ore color tints per object def ID */
+  private static readonly ROCK_COLORS: Record<number, [number, number, number]> = {
+    3: [0.72, 0.45, 0.20],  // Copper Rock — warm orange-brown
+    4: [0.45, 0.35, 0.32],  // Iron Rock — dark reddish-brown
+  };
+  private static readonly ROCK_DEPLETED_COLOR: [number, number, number] = [0.4, 0.4, 0.4]; // grey when mined
+
+  private async loadRockModel(): Promise<void> {
+    try {
+      const result = await SceneLoader.ImportMeshAsync('', '/models/', 'rpgRock.glb', this.scene);
+
+      let minY = Infinity;
+      let maxY = -Infinity;
+      for (const mesh of result.meshes) {
+        if (mesh.getTotalVertices() === 0) continue;
+        mesh.computeWorldMatrix(true);
+        const bb = mesh.getBoundingInfo().boundingBox;
+        if (bb.minimumWorld.y < minY) minY = bb.minimumWorld.y;
+        if (bb.maximumWorld.y > maxY) maxY = bb.maximumWorld.y;
+      }
+      const modelHeight = maxY - minY;
+      this.rockModelScale = modelHeight > 0 ? 1.0 / modelHeight : 1;
+
+      const root = new TransformNode('rockTemplate', this.scene);
+      for (const mesh of result.meshes) {
+        if (!mesh.parent) {
+          mesh.parent = root;
+        }
+      }
+      for (const child of root.getChildren()) {
+        (child as TransformNode).position.y -= minY;
+      }
+
+      root.setEnabled(false);
+      this.rockModelTemplate = root;
+      console.log(`Rock model loaded (height=${modelHeight.toFixed(2)}, minY=${minY.toFixed(2)}, scale=${this.rockModelScale.toFixed(3)})`);
+
+      this.upgradeRockSpritesToModels();
+    } catch (e) {
+      console.warn('Failed to load rock model, falling back to sprites:', e);
+    }
+  }
+
+  private createRockModel(objectEntityId: number, objectDefId: number, x: number, z: number, isDepleted: boolean): void {
+    if (!this.rockModelTemplate) return;
+
+    const clone = this.rockModelTemplate.instantiateHierarchy(null, undefined, (source, cloned) => {
+      cloned.name = source.name + `_rock_${objectEntityId}`;
+    })!;
+    clone.setEnabled(true);
+
+    // Apply ore-specific color tint
+    const tint = isDepleted
+      ? GameManager.ROCK_DEPLETED_COLOR
+      : (GameManager.ROCK_COLORS[objectDefId] ?? [0.5, 0.5, 0.5]);
+
+    for (const child of clone.getChildMeshes()) {
+      child.setEnabled(true);
+      child.metadata = { objectEntityId };
+      // Create unique material per rock instance for individual coloring
+      const mat = new StandardMaterial(`rockMat_${objectEntityId}_${child.name}`, this.scene);
+      mat.diffuseColor = new Color3(tint[0], tint[1], tint[2]);
+      mat.specularColor = new Color3(0.15, 0.15, 0.15);
+      child.material = mat;
+    }
+
+    const s = this.rockModelScale;
+    clone.scaling.set(s, s, s);
+    clone.position.set(x, this.getHeight(x, z), z);
+    this.worldObjectModels.set(objectEntityId, clone);
+  }
+
+  private updateRockColor(objectEntityId: number, objectDefId: number, isDepleted: boolean): void {
+    const model = this.worldObjectModels.get(objectEntityId);
+    if (!model) return;
+    const tint = isDepleted
+      ? GameManager.ROCK_DEPLETED_COLOR
+      : (GameManager.ROCK_COLORS[objectDefId] ?? [0.5, 0.5, 0.5]);
+    for (const child of model.getChildMeshes()) {
+      const mat = child.material as StandardMaterial;
+      if (mat?.diffuseColor) {
+        mat.diffuseColor.set(tint[0], tint[1], tint[2]);
+      }
+    }
+  }
+
+  private upgradeRockSpritesToModels(): void {
+    if (!this.rockModelTemplate) return;
+    for (const [objectEntityId, data] of this.worldObjectDefs) {
+      if (this.worldObjectModels.has(objectEntityId)) continue;
+      const def = this.objectDefsCache.get(data.defId);
+      if (def?.category !== 'rock') continue;
+      const sprite = this.worldObjectSprites.get(objectEntityId);
+      if (sprite) {
+        sprite.dispose();
+        this.worldObjectSprites.delete(objectEntityId);
+      }
+      this.createRockModel(objectEntityId, data.defId, data.x, data.z, data.depleted);
     }
   }
 
@@ -565,11 +669,14 @@ export class GameManager {
 
       const def = this.objectDefsCache.get(objectDefId);
       const isTree = def?.category === 'tree';
+      const isRock = def?.category === 'rock';
 
       // Create visual if not yet created
       if (isTree && this.treeModelTemplate && !this.worldObjectModels.has(objectEntityId)) {
         this.createTreeModel(objectEntityId, objectDefId, x, z, isDepleted);
-      } else if ((!isTree || !this.treeModelTemplate) && !this.worldObjectSprites.has(objectEntityId) && !this.worldObjectModels.has(objectEntityId)) {
+      } else if (isRock && this.rockModelTemplate && !this.worldObjectModels.has(objectEntityId)) {
+        this.createRockModel(objectEntityId, objectDefId, x, z, isDepleted);
+      } else if ((!isTree || !this.treeModelTemplate) && (!isRock || !this.rockModelTemplate) && !this.worldObjectSprites.has(objectEntityId) && !this.worldObjectModels.has(objectEntityId)) {
         const name = def?.name ?? `Object${objectDefId}`;
         const color = def?.color
           ? new Color3(def.color[0] / 255, def.color[1] / 255, def.color[2] / 255)
@@ -608,9 +715,17 @@ export class GameManager {
       const data = this.worldObjectDefs.get(objectEntityId);
       if (data) data.depleted = isDepleted === 1;
 
+      const def = data ? this.objectDefsCache.get(data.defId) : null;
+      const isRock = def?.category === 'rock';
+
       const model = this.worldObjectModels.get(objectEntityId);
       if (model) {
-        model.setEnabled(isDepleted === 0);
+        if (isRock && data) {
+          // Rocks change color instead of hiding (grey when depleted, ore color when respawned)
+          this.updateRockColor(objectEntityId, data.defId, isDepleted === 1);
+        } else {
+          model.setEnabled(isDepleted === 0);
+        }
       } else {
         const sprite = this.worldObjectSprites.get(objectEntityId);
         if (sprite) {
