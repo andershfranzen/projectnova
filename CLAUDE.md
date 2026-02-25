@@ -81,6 +81,44 @@ ProjectRS/
 │   │       ├── LoginScreen.ts    # Login/signup form with tab switching, token auth
 │   │       ├── StatsPanel.ts     # HP bar (top-left)
 │   │       └── Minimap.ts        # 150px canvas overlay (top-right), reads tiles from ChunkManager
+├── editor/                   # Map editor (Vite + TypeScript)
+│   ├── index.html
+│   ├── vite.config.ts        # Runs on :5174, proxies to :4000
+│   ├── src/
+│   │   ├── main.ts           # Entry point
+│   │   ├── EditorApp.ts      # Main editor controller (load/save, tool switching)
+│   │   ├── api/
+│   │   │   └── EditorApi.ts  # HTTP API client for load/save/create/export/import maps
+│   │   ├── canvas/
+│   │   │   ├── MapCanvas.ts      # Main 2D canvas with pan/zoom, delegates to renderers
+│   │   │   ├── TileRenderer.ts   # Renders tiles + building overlays (floors/stairs/roofs)
+│   │   │   ├── HeightRenderer.ts # Height visualization overlay
+│   │   │   ├── WallRenderer.ts   # Wall edge visualization (uses wallHeights for opacity)
+│   │   │   ├── GridOverlay.ts    # Optional grid lines
+│   │   │   ├── SpawnRenderer.ts  # NPC/object spawn point markers
+│   │   │   ├── MinimapCanvas.ts  # Small overview map
+│   │   │   └── BuildingRenderer.ts # Renders floors/stairs/roofs on editor canvas
+│   │   ├── panels/
+│   │   │   ├── Toolbar.ts        # Tool buttons + settings panels (tile, height, wall, floor, stair, roof, NPC, object)
+│   │   │   ├── MapSelector.ts    # Map list + create/load/export/import
+│   │   │   ├── TilePalette.ts    # Tile type color swatches
+│   │   │   └── PropertiesPanel.ts # Map properties editor (name, fog, spawn, transitions)
+│   │   ├── state/
+│   │   │   ├── EditorState.ts    # Central state: tiles, heights, walls, floors, stairs, roofs + getters/setters
+│   │   │   └── UndoManager.ts    # Undo/redo with snapshot diffs
+│   │   └── tools/                # Tool implementations (BaseTool interface)
+│   │       ├── BaseTool.ts       # EditorToolInterface + EditorToolContext
+│   │       ├── TileBrush.ts      # Paint tile types
+│   │       ├── HeightBrush.ts    # Set/raise/lower/smooth heights
+│   │       ├── WallBrush.ts      # Paint wall edges (with height slider)
+│   │       ├── FloorBrush.ts     # Paint/remove elevated floors
+│   │       ├── StairPlacer.ts    # Place/remove stairs (direction + heights)
+│   │       ├── RoofBrush.ts      # Paint/remove roofs (flat/peaked)
+│   │       ├── FloodFill.ts, RectTool.ts, LineTool.ts  # Shape tools
+│   │       ├── NpcPlacer.ts, ObjectPlacer.ts            # Entity placement
+│   │       ├── SpawnDragger.ts, SpawnEraser.ts          # Spawn management
+│   │       ├── SelectTool.ts     # Region selection + copy/paste
+│   │       └── Eyedropper.ts     # Sample tile type from canvas
 ├── tools/
 │   └── generate-maps.ts      # Generates heightmap/tilemap PNGs, meta.json, spawns.json for all maps
 ```
@@ -127,7 +165,7 @@ Transitions are defined per-tile in meta.json. When a player steps on a transiti
 Terrain is divided into 32x32 tile chunks (`CHUNK_SIZE=32`, `CHUNK_LOAD_RADIUS=2` = 5x5 grid around player).
 
 - **Server (`ChunkManager.ts`):** Pure spatial index mapping entity IDs to chunk coordinates. Used to filter broadcasts — only sends entity updates to players whose loaded chunks overlap.
-- **Client (`rendering/ChunkManager.ts`):** Fetches map PNGs via HTTP, decodes them, and builds BabylonJS meshes per chunk (ground mesh with vertex colors, water mesh at waterLevel with alpha, wall mesh extruded to 1.8 height). Loads/disposes chunks dynamically as the player moves.
+- **Client (`rendering/ChunkManager.ts`):** Fetches map PNGs via HTTP, decodes them, and builds BabylonJS meshes per chunk (ground mesh with vertex colors, water mesh at waterLevel with alpha, wall mesh with variable heights, roof mesh, floor mesh, stair mesh). Loads/disposes chunks dynamically as the player moves.
 
 ### Movement Model
 
@@ -152,11 +190,40 @@ Key server→client opcodes:
 | SKILLING_START | 57 | Begin skilling animation |
 | SKILLING_STOP | 58 | Stop skilling |
 | MAP_CHANGE | 60 | String packet: new map ID + coordinates |
+| FLOOR_CHANGE | 61 | Player changed floor level (multi-floor buildings) |
 
 Key client→server opcodes:
 | Opcode | Value | Purpose |
 |--------|-------|---------|
 | PLAYER_INTERACT_OBJECT | 40 | Interact with world object (harvest/craft) |
+
+### Building System (Edge Walls, Floors, Stairs, Roofs)
+
+Buildings are defined in `walls.json` per map (backwards-compatible extension):
+
+```json
+{
+  "walls": { "x,z": bitmask },           // N=1, E=2, S=4, W=8 edge bitmask
+  "wallHeights": { "x,z": number },      // wall height override (default 1.8)
+  "floors": { "x,z": number },           // elevated floor Y height
+  "stairs": { "x,z": { "direction": "N"|"E"|"S"|"W", "baseHeight": 0, "topHeight": 3.5 } },
+  "roofs": { "x,z": { "height": 3.5, "style": "flat"|"peaked_ns"|"peaked_ew", "peakHeight": 0.6 } }
+}
+```
+
+**Wall system:** Edge-based thin walls (not full tiles). Each tile has a 4-bit bitmask for N/E/S/W edges. Walls block pathfinding via `isWallBlocked()` on both client and server. The server validates all paths against walls.
+
+**Height priority for entities:** `getEffectiveHeight(x, z)` returns: stairs (interpolated) > elevated floors > terrain height. Used by both server and client for Y positioning.
+
+**Rendering:** ChunkManager builds separate meshes per chunk:
+- Wall mesh: extruded quads per edge, variable height per tile, accounts for floor height
+- Floor mesh: walkable platform with top/bottom faces and edge faces where neighbors differ
+- Stair mesh: 4-step ramp with direction, rendered as individual step treads and risers
+- Roof mesh: flat quad or two-slope peaked roof per tile
+
+**Editor tools:** FloorBrush (click/shift+click), StairPlacer (direction + heights), RoofBrush (style selector), WallBrush (extended with height slider).
+
+**Multi-floor foundation:** Entities have `currentFloor`, server sends `FLOOR_CHANGE` (opcode 61) on stair transitions. Phase 4 (separate tile layers per floor, camera culling) is planned but not yet implemented.
 
 ### Authentication
 
@@ -295,6 +362,10 @@ Auto-saves every 60 seconds and on map transitions.
 - **Position naming convention:** `position.x` = world X, `position.y` = world Z (historical naming in the protocol).
 - **Entity IDs:** Players and NPCs share auto-incrementing IDs. World objects start at 10000 to avoid collisions.
 - **MAP_CHANGE is a string packet:** Opcode 60 uses a special encoding (`decodeStringPacket`) unlike other binary opcodes.
+- **Race condition on map load:** Server sends entity data before client finishes loading heightmap PNG. `getHeight()` returns 0 when heights are null. Fix: `repositionWorldObjects()` recalculates all entity Y positions after map load. This applies to initial load and map transitions.
+- **GLB __root__ node:** Babylon's GLB loader creates a `__root__` Mesh (0 vertices) with coordinate system transforms (rotation + scale). It's included in `result.meshes`. When cloning via `instantiateHierarchy`, transforms are properly copied.
+- **Client pathfinding must check walls:** All `findPath()` calls must pass `isWallBlocked` callback. Without it, client predicts paths through thin walls (server truncates the path but client visually walks through).
+- **Editor save format changed:** `EditorApi.saveMap()` now takes a single `LoadedMap` object instead of individual parameters. The `walls.json` format is extended with optional `wallHeights`, `floors`, `stairs`, `roofs` fields.
 
 ## What's Implemented
 
@@ -331,6 +402,16 @@ Auto-saves every 60 seconds and on map transitions.
 - [x] Linear fog per map (sky blue overworld, dark purple underground)
 - [x] Login/signup screen with token-based sessions (localStorage persistence)
 - [x] Map generation tool (`bun tools/generate-maps.ts`)
+- [x] Edge-based thin walls with collision (N/E/S/W bitmask per tile)
+- [x] Variable wall heights (per-tile override, default 1.8)
+- [x] Elevated floor tiles (platforms at arbitrary Y)
+- [x] Stairs (4-step ramps with direction and height interpolation)
+- [x] Roofs (flat and peaked NS/EW styles)
+- [x] 3D tree models (pinetree.glb, auto-replaces sprites for tree category)
+- [x] Terrain-aligned destination marker
+- [x] Map editor with visual tools for tiles, heights, walls, floors, stairs, roofs, NPCs, objects
+- [x] Map editor: undo/redo, copy/paste regions, flood fill, line/rect tools
+- [x] Map editor: export/import, create new maps, live reload
 
 ## Not Yet Implemented
 
@@ -341,4 +422,5 @@ Auto-saves every 60 seconds and on map transitions.
 - [ ] Death penalty (currently respawns at full HP, no item loss)
 - [ ] Ranged/magic combat (formulas exist in shared/skills.ts but not wired up)
 - [ ] Crafting skill (crafting recipes, not yet defined)
-- [ ] 3D object models (currently billboard sprites with colored rectangles)
+- [ ] 3D object models (pinetree.glb works, need more models)
+- [ ] Multi-floor system Phase 4 (separate tile/wall layers per floor, camera culling, editor floor selector)
