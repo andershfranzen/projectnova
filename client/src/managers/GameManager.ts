@@ -1024,7 +1024,8 @@ export class GameManager {
 
     const path = findPath(this.playerX, this.playerZ, worldX, worldZ,
       (x, z) => this.chunkManager.isBlocked(x, z),
-      this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight());
+      this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
+      (fx, fz, tx, tz) => this.chunkManager.isWallBlocked(fx, fz, tx, tz));
 
     if (path.length > 0) {
       this.path = path;
@@ -1123,7 +1124,8 @@ export class GameManager {
           if (this.path.length === 0 || dist > 3) {
             const newPath = findPath(this.playerX, this.playerZ, npcTarget.x, npcTarget.z,
               (x, z) => this.chunkManager.isBlocked(x, z),
-              this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight());
+              this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
+              (fx, fz, tx, tz) => this.chunkManager.isWallBlocked(fx, fz, tx, tz));
             if (newPath.length > 1) {
               const last = newPath[newPath.length - 1];
               if (Math.floor(last.x) === Math.floor(npcTarget.x) && Math.floor(last.z) === Math.floor(npcTarget.z)) {
