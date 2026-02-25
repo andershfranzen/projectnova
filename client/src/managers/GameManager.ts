@@ -2,7 +2,7 @@ import { Engine } from '@babylonjs/core/Engines/engine';
 import { Scene } from '@babylonjs/core/scene';
 import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight';
 import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight';
-import { Vector3, Color3, Color4, Matrix } from '@babylonjs/core/Maths/math';
+import { Vector3, Color3, Color4, Matrix, Quaternion } from '@babylonjs/core/Maths/math';
 import { Viewport } from '@babylonjs/core/Maths/math.viewport';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
@@ -1009,7 +1009,6 @@ export class GameManager {
 
   private createDestinationMarker(): void {
     const marker = MeshBuilder.CreateDisc('destMarker', { radius: 0.3, tessellation: 6 }, this.scene);
-    marker.rotation.x = Math.PI / 2;
     marker.isVisible = false;
     const mat = new StandardMaterial('destMarkerMat', this.scene);
     mat.diffuseColor = new Color3(1, 1, 0);
@@ -1017,6 +1016,28 @@ export class GameManager {
     mat.specularColor = Color3.Black();
     marker.material = mat;
     this.destMarker = marker;
+  }
+
+  /** Align the destination marker to the terrain normal at (x, z) */
+  private alignMarkerToTerrain(x: number, z: number): void {
+    const d = 0.25; // sample offset for gradient
+    const hC = this.getHeight(x, z);
+    const hR = this.getHeight(x + d, z);
+    const hF = this.getHeight(x, z + d);
+    // Terrain tangent vectors
+    const tx = new Vector3(d, hR - hC, 0);
+    const tz = new Vector3(0, hF - hC, d);
+    // Normal = cross product (tz × tx gives upward-facing normal)
+    const normal = Vector3.Cross(tz, tx).normalize();
+    // Build rotation from up vector (0,1,0) to terrain normal
+    const up = Vector3.Up();
+    const angle = Math.acos(Math.min(1, Vector3.Dot(up, normal)));
+    if (angle > 0.001) {
+      const axis = Vector3.Cross(up, normal).normalize();
+      this.destMarker.rotationQuaternion = Quaternion.RotationAxis(axis, angle);
+    } else {
+      this.destMarker.rotationQuaternion = Quaternion.Identity();
+    }
   }
 
   private handleGroundClick(worldX: number, worldZ: number): void {
@@ -1033,6 +1054,7 @@ export class GameManager {
       this.destMarker.position.x = dest.x;
       this.destMarker.position.y = this.getHeight(dest.x, dest.z) + 0.02;
       this.destMarker.position.z = dest.z;
+      this.alignMarkerToTerrain(dest.x, dest.z);
       this.destMarker.isVisible = true;
       this.network.sendMove(path);
     }
