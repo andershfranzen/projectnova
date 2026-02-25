@@ -30,7 +30,7 @@ export class Npc extends Entity {
     this.spawnZ = z;
   }
 
-  processAI(isBlocked: (x: number, z: number) => boolean): void {
+  processAI(isBlocked: (x: number, z: number) => boolean, isWallBlocked?: (fx: number, fz: number, tx: number, tz: number) => boolean): void {
     if (this.dead) return;
 
     // Returning to spawn after losing combat target (walk back)
@@ -44,7 +44,7 @@ export class Npc extends Entity {
         this.returning = false;
         return;
       }
-      this.stepToward(this.spawnX, this.spawnZ, isBlocked);
+      this.stepToward(this.spawnX, this.spawnZ, isBlocked, isWallBlocked);
       return;
     }
 
@@ -99,7 +99,7 @@ export class Npc extends Entity {
             Math.abs(nz - this.spawnZ) <= Npc.RETREAT_MAX_RANGE) {
           const targetTileX = Math.floor(targetX);
           const targetTileZ = Math.floor(targetZ);
-          this.stepTowardAvoidTile(targetX, targetZ, targetTileX, targetTileZ, isBlocked);
+          this.stepTowardAvoidTile(targetX, targetZ, targetTileX, targetTileZ, isBlocked, isWallBlocked);
         } else {
           this.combatTarget = null;
           this.returning = true;
@@ -128,10 +128,11 @@ export class Npc extends Entity {
         // Check within wander range of spawn
         const dxSpawn = nx - this.spawnX;
         const dzSpawn = nz - this.spawnZ;
+        const wallBlock = isWallBlocked ? isWallBlocked(this.position.x, this.position.y, nx, nz) : false;
         if (
           Math.abs(dxSpawn) <= this.def.wanderRange &&
           Math.abs(dzSpawn) <= this.def.wanderRange &&
-          !isBlocked(nx, nz)
+          !isBlocked(nx, nz) && !wallBlock
         ) {
           this.position.x = nx;
           this.position.y = nz;
@@ -144,7 +145,8 @@ export class Npc extends Entity {
   private stepTowardAvoidTile(
     tx: number, tz: number,
     avoidTileX: number, avoidTileZ: number,
-    isBlocked: (x: number, z: number) => boolean
+    isBlocked: (x: number, z: number) => boolean,
+    isWallBlocked?: (fx: number, fz: number, tx: number, tz: number) => boolean
   ): void {
     const dx = tx - this.position.x;
     const dz = tz - this.position.y;
@@ -152,31 +154,37 @@ export class Npc extends Entity {
     const sz = dz !== 0 ? Math.sign(dz) : 0;
     const onAvoid = (px: number, pz: number) =>
       Math.floor(px) === avoidTileX && Math.floor(pz) === avoidTileZ;
+    const wBlocked = (fx: number, fz: number, tx2: number, tz2: number) =>
+      isWallBlocked ? isWallBlocked(fx, fz, tx2, tz2) : false;
+    const px = this.position.x, py = this.position.y;
 
-    if (sx !== 0 && sz !== 0 && !isBlocked(this.position.x + sx, this.position.y + sz) && !onAvoid(this.position.x + sx, this.position.y + sz)) {
+    if (sx !== 0 && sz !== 0 && !isBlocked(px + sx, py + sz) && !onAvoid(px + sx, py + sz) && !wBlocked(px, py, px + sx, py + sz)) {
       this.position.x += sx;
       this.position.y += sz;
-    } else if (sx !== 0 && !isBlocked(this.position.x + sx, this.position.y) && !onAvoid(this.position.x + sx, this.position.y)) {
+    } else if (sx !== 0 && !isBlocked(px + sx, py) && !onAvoid(px + sx, py) && !wBlocked(px, py, px + sx, py)) {
       this.position.x += sx;
-    } else if (sz !== 0 && !isBlocked(this.position.x, this.position.y + sz) && !onAvoid(this.position.x, this.position.y + sz)) {
+    } else if (sz !== 0 && !isBlocked(px, py + sz) && !onAvoid(px, py + sz) && !wBlocked(px, py, px, py + sz)) {
       this.position.y += sz;
     }
   }
 
   /** Step one tile toward (tx, tz), trying diagonal first then cardinal */
-  private stepToward(tx: number, tz: number, isBlocked: (x: number, z: number) => boolean): void {
+  private stepToward(tx: number, tz: number, isBlocked: (x: number, z: number) => boolean, isWallBlocked?: (fx: number, fz: number, tx: number, tz: number) => boolean): void {
     const dx = tx - this.position.x;
     const dz = tz - this.position.y;
     const sx = dx !== 0 ? Math.sign(dx) : 0;
     const sz = dz !== 0 ? Math.sign(dz) : 0;
+    const wBlocked = (fx: number, fz: number, tx2: number, tz2: number) =>
+      isWallBlocked ? isWallBlocked(fx, fz, tx2, tz2) : false;
+    const px = this.position.x, py = this.position.y;
 
     // Try diagonal
-    if (sx !== 0 && sz !== 0 && !isBlocked(this.position.x + sx, this.position.y + sz)) {
+    if (sx !== 0 && sz !== 0 && !isBlocked(px + sx, py + sz) && !wBlocked(px, py, px + sx, py + sz)) {
       this.position.x += sx;
       this.position.y += sz;
-    } else if (sx !== 0 && !isBlocked(this.position.x + sx, this.position.y)) {
+    } else if (sx !== 0 && !isBlocked(px + sx, py) && !wBlocked(px, py, px + sx, py)) {
       this.position.x += sx;
-    } else if (sz !== 0 && !isBlocked(this.position.x, this.position.y + sz)) {
+    } else if (sz !== 0 && !isBlocked(px, py + sz) && !wBlocked(px, py, px, py + sz)) {
       this.position.y += sz;
     }
   }

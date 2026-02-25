@@ -81,7 +81,8 @@ export function findPath(
   isBlocked: (x: number, z: number) => boolean,
   mapWidth: number = 1024,
   mapHeight: number = 1024,
-  maxSteps: number = 200
+  maxSteps: number = 200,
+  isWallBlocked?: (fx: number, fz: number, tx: number, tz: number) => boolean
 ): { x: number; z: number }[] {
   const sx = Math.floor(startX);
   const sz = Math.floor(startZ);
@@ -103,7 +104,7 @@ export function findPath(
       }
     }
     if (!bestNeighbor) return [];
-    return findPath(startX, startZ, bestNeighbor.x + 0.5, bestNeighbor.z + 0.5, isBlocked, mapWidth, mapHeight, maxSteps);
+    return findPath(startX, startZ, bestNeighbor.x + 0.5, bestNeighbor.z + 0.5, isBlocked, mapWidth, mapHeight, maxSteps, isWallBlocked);
   }
 
   const open = new MinHeap();
@@ -142,11 +143,12 @@ export function findPath(
 
     closed.add(k);
 
-    for (const neighbor of getNeighbors(current.x, current.z, isBlocked)) {
+    for (const neighbor of getNeighbors(current.x, current.z, isBlocked, isWallBlocked)) {
       const nk = key(neighbor.x, neighbor.z);
       if (closed.has(nk)) continue;
       if (neighbor.x < 0 || neighbor.x >= mapWidth || neighbor.z < 0 || neighbor.z >= mapHeight) continue;
       if (isBlocked(neighbor.x, neighbor.z)) continue;
+      if (isWallBlocked && isWallBlocked(current.x, current.z, neighbor.x, neighbor.z)) continue;
 
       const isDiagonal = neighbor.x !== current.x && neighbor.z !== current.z;
       const g = current.g + (isDiagonal ? 1.414 : 1);
@@ -172,7 +174,11 @@ export function findPath(
   return [];
 }
 
-function getNeighbors(x: number, z: number, isBlocked: (x: number, z: number) => boolean): { x: number; z: number }[] {
+function getNeighbors(
+  x: number, z: number,
+  isBlocked: (x: number, z: number) => boolean,
+  isWallBlocked?: (fx: number, fz: number, tx: number, tz: number) => boolean
+): { x: number; z: number }[] {
   const neighbors = [
     { x: x - 1, z },
     { x: x + 1, z },
@@ -180,10 +186,15 @@ function getNeighbors(x: number, z: number, isBlocked: (x: number, z: number) =>
     { x, z: z + 1 },
   ];
 
-  if (!isBlocked(x - 1, z) && !isBlocked(x, z - 1)) neighbors.push({ x: x - 1, z: z - 1 });
-  if (!isBlocked(x + 1, z) && !isBlocked(x, z - 1)) neighbors.push({ x: x + 1, z: z - 1 });
-  if (!isBlocked(x - 1, z) && !isBlocked(x, z + 1)) neighbors.push({ x: x - 1, z: z + 1 });
-  if (!isBlocked(x + 1, z) && !isBlocked(x, z + 1)) neighbors.push({ x: x + 1, z: z + 1 });
+  const wb = isWallBlocked || (() => false);
+  const canW = !isBlocked(x - 1, z) && !wb(x, z, x - 1, z);
+  const canE = !isBlocked(x + 1, z) && !wb(x, z, x + 1, z);
+  const canN = !isBlocked(x, z - 1) && !wb(x, z, x, z - 1);
+  const canS = !isBlocked(x, z + 1) && !wb(x, z, x, z + 1);
+  if (canW && canN) neighbors.push({ x: x - 1, z: z - 1 });
+  if (canE && canN) neighbors.push({ x: x + 1, z: z - 1 });
+  if (canW && canS) neighbors.push({ x: x - 1, z: z + 1 });
+  if (canE && canS) neighbors.push({ x: x + 1, z: z + 1 });
 
   return neighbors;
 }

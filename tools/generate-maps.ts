@@ -26,6 +26,12 @@ const WALL = 4;
 const SAND = 5;
 const WOOD = 6;
 
+// Wall edge bitmask constants (matching WallEdge in shared/types.ts)
+const WALL_N = 1;
+const WALL_E = 2;
+const WALL_S = 4;
+const WALL_W = 8;
+
 // Color palette matching TILEMAP_COLORS in shared/types.ts
 const COLORS: Record<number, [number, number, number]> = {
   [GRASS]: [0x4a, 0x8a, 0x30],
@@ -247,7 +253,7 @@ function generateOverworldHeightmap(): Buffer {
 
 // ========== OVERWORLD TILEMAP (1024x1024) ==========
 
-function generateOverworldTilemap(): Buffer {
+function generateOverworldTilemap(): { png: Buffer; walls: Record<string, number> } {
   const SIZE = OVERWORLD_SIZE;
   const png = new PNG({ width: SIZE, height: SIZE, colorType: 2 /* RGB */ });
 
@@ -257,15 +263,40 @@ function generateOverworldTilemap(): Buffer {
     tiles[x] = new Array(SIZE).fill(GRASS);
   }
 
-  // Helper: place a building (walls + wood floor + doorway)
+  // Edge-based wall data: "x,z" -> bitmask (N=1, E=2, S=4, W=8)
+  const wallEdges: Record<string, number> = {};
+
+  function addWallEdge(x: number, z: number, edge: number): void {
+    const key = `${x},${z}`;
+    wallEdges[key] = (wallEdges[key] || 0) | edge;
+  }
+
+  /** Set wall edge and its reciprocal on the neighbor tile */
+  function setWallEdgePair(x: number, z: number, edge: number): void {
+    addWallEdge(x, z, edge);
+    // Set reciprocal
+    if (edge === WALL_N && z > 0)          addWallEdge(x, z - 1, WALL_S);
+    if (edge === WALL_S && z < SIZE - 1)   addWallEdge(x, z + 1, WALL_N);
+    if (edge === WALL_E && x < SIZE - 1)   addWallEdge(x + 1, z, WALL_W);
+    if (edge === WALL_W && x > 0)          addWallEdge(x - 1, z, WALL_E);
+  }
+
+  // Helper: place a building (wood floor + wall edges on perimeter, dirt doorway)
   function placeBuilding(bx: number, bz: number, w: number, h: number): void {
+    const doorX = bx + Math.floor(w / 2);
     for (let x = bx; x < bx + w; x++) {
       for (let z = bz; z < bz + h; z++) {
         if (x === bx || x === bx + w - 1 || z === bz || z === bz + h - 1) {
-          if (z === bz && x === bx + Math.floor(w / 2)) {
-            tiles[x][z] = DIRT; // doorway
+          // Perimeter tile — use wood floor (or dirt for doorway)
+          if (z === bz && x === doorX) {
+            tiles[x][z] = DIRT; // doorway — no wall edges here
           } else {
-            tiles[x][z] = WALL;
+            tiles[x][z] = WOOD;
+            // Add wall edges on all outward-facing sides
+            if (x === bx)         setWallEdgePair(x, z, WALL_W);
+            if (x === bx + w - 1) setWallEdgePair(x, z, WALL_E);
+            if (z === bz)         setWallEdgePair(x, z, WALL_N);
+            if (z === bz + h - 1) setWallEdgePair(x, z, WALL_S);
           }
         } else {
           tiles[x][z] = WOOD;
@@ -274,13 +305,22 @@ function generateOverworldTilemap(): Buffer {
     }
   }
 
-  // Helper: place a tent (wall border + dirt floor + doorway)
+  // Helper: place a tent (dirt floor + wall edges on perimeter, doorway gap)
   function placeTent(cx: number, cz: number, size: number): void {
+    const doorX = cx + Math.floor(size / 2);
     for (let x = cx; x < cx + size; x++) {
       for (let z = cz; z < cz + size; z++) {
         if (x === cx || x === cx + size - 1 || z === cz || z === cz + size - 1) {
-          if (z === cz && x === cx + Math.floor(size / 2)) continue; // doorway
-          tiles[x][z] = WALL;
+          if (z === cz && x === doorX) {
+            tiles[x][z] = DIRT; // doorway
+            continue;
+          }
+          tiles[x][z] = DIRT;
+          // Add wall edges on outward-facing sides
+          if (x === cx)              setWallEdgePair(x, z, WALL_W);
+          if (x === cx + size - 1)   setWallEdgePair(x, z, WALL_E);
+          if (z === cz)              setWallEdgePair(x, z, WALL_N);
+          if (z === cz + size - 1)   setWallEdgePair(x, z, WALL_S);
         } else {
           tiles[x][z] = DIRT;
         }
@@ -471,30 +511,44 @@ function generateOverworldTilemap(): Buffer {
     for (let z = 710; z <= 790; z++)
       tiles[x][z] = STONE;
 
-  // Outer walls with gaps
+  // Outer walls with gaps — edge-based walls on the boundary tiles
   for (let x = 710; x <= 790; x++) {
-    if (x % 8 !== 0) { tiles[x][710] = WALL; tiles[x][790] = WALL; }
+    if (x % 8 !== 0) {
+      setWallEdgePair(x, 710, WALL_N); // north edge of top row
+      setWallEdgePair(x, 790, WALL_S); // south edge of bottom row
+    }
   }
   for (let z = 710; z <= 790; z++) {
-    if (z % 8 !== 0) { tiles[710][z] = WALL; tiles[790][z] = WALL; }
+    if (z % 8 !== 0) {
+      setWallEdgePair(710, z, WALL_W); // west edge of left col
+      setWallEdgePair(790, z, WALL_E); // east edge of right col
+    }
   }
 
-  // Inner partial wall structures
+  // Inner partial wall structures — edge-based
+  for (let z = 740; z <= 780; z++) {
+    if (z % 3 !== 0) {
+      setWallEdgePair(730, z, WALL_W);
+      setWallEdgePair(770, z, WALL_E);
+    }
+  }
   for (let x = 730; x <= 770; x++) {
-    for (let z = 740; z <= 780; z++) {
-      if ((x === 730 || x === 770) && z % 3 !== 0) tiles[x][z] = WALL;
-      if ((z === 740 || z === 780) && x % 3 !== 0) tiles[x][z] = WALL;
+    if (x % 3 !== 0) {
+      setWallEdgePair(x, 740, WALL_N);
+      setWallEdgePair(x, 780, WALL_S);
     }
   }
 
-  // Boss chamber in south of ruins (745-755, 765-775)
+  // Boss chamber in south of ruins (745-755, 765-775) — edge-based walls
   for (let x = 745; x <= 755; x++) {
-    for (let z = 765; z <= 775; z++) {
-      if (x === 745 || x === 755 || z === 765 || z === 775) {
-        if (x === 750 && z === 765) continue; // doorway
-        tiles[x][z] = WALL;
-      }
+    if (!(x === 750)) { // skip doorway at x=750 on north edge
+      setWallEdgePair(x, 765, WALL_N);
     }
+    setWallEdgePair(x, 775, WALL_S);
+  }
+  for (let z = 765; z <= 775; z++) {
+    setWallEdgePair(745, z, WALL_W);
+    setWallEdgePair(755, z, WALL_E);
   }
 
   // Dungeon entrance marker: stone staircase pattern at (750, 720)
@@ -581,7 +635,7 @@ function generateOverworldTilemap(): Buffer {
     }
   }
 
-  return PNG.sync.write(png);
+  return { png: PNG.sync.write(png), walls: wallEdges };
 }
 
 // ========== UNDERGROUND HEIGHTMAP (257x257 vertices) ==========
@@ -613,7 +667,7 @@ function generateUndergroundHeightmap(): Buffer {
 
 // ========== UNDERGROUND TILEMAP (256x256) ==========
 
-function generateUndergroundTilemap(): Buffer {
+function generateUndergroundTilemap(): { png: Buffer; walls: Record<string, number> } {
   const SIZE = UNDERGROUND_SIZE;
   const png = new PNG({ width: SIZE, height: SIZE, colorType: 2 });
 
@@ -622,6 +676,9 @@ function generateUndergroundTilemap(): Buffer {
   for (let x = 0; x < SIZE; x++) {
     tiles[x] = new Array(SIZE).fill(WALL);
   }
+
+  // Edge-based wall data (underground doesn't need many — solid WALL tiles handle blocking)
+  const wallEdges: Record<string, number> = {};
 
   // Carve a rectangular room (stone floor, wall border, doorways)
   function carveRoom(
@@ -739,7 +796,7 @@ function generateUndergroundTilemap(): Buffer {
     }
   }
 
-  return PNG.sync.write(png);
+  return { png: PNG.sync.write(png), walls: wallEdges };
 }
 
 // ========== WRITE EVERYTHING ==========
@@ -755,7 +812,10 @@ const BASE = resolve(import.meta.dir, '../server/data/maps');
   writeFileSync(resolve(dir, 'heightmap.png'), generateOverworldHeightmap());
 
   console.log('Generating overworld tilemap (1024x1024)...');
-  writeFileSync(resolve(dir, 'tilemap.png'), generateOverworldTilemap());
+  const overworldResult = generateOverworldTilemap();
+  writeFileSync(resolve(dir, 'tilemap.png'), overworldResult.png);
+  writeFileSync(resolve(dir, 'walls.json'), JSON.stringify({ walls: overworldResult.walls }, null, 2));
+  console.log(`  ${Object.keys(overworldResult.walls).length} wall edges written.`);
 
   const meta = {
     id: 'overworld',
@@ -907,7 +967,10 @@ const BASE = resolve(import.meta.dir, '../server/data/maps');
   writeFileSync(resolve(dir, 'heightmap.png'), generateUndergroundHeightmap());
 
   console.log('Generating underground tilemap (256x256)...');
-  writeFileSync(resolve(dir, 'tilemap.png'), generateUndergroundTilemap());
+  const undergroundResult = generateUndergroundTilemap();
+  writeFileSync(resolve(dir, 'tilemap.png'), undergroundResult.png);
+  writeFileSync(resolve(dir, 'walls.json'), JSON.stringify({ walls: undergroundResult.walls }, null, 2));
+  console.log(`  ${Object.keys(undergroundResult.walls).length} wall edges written.`);
 
   const meta = {
     id: 'underground',

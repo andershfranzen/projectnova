@@ -3,8 +3,8 @@ import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData';
-import { CHUNK_SIZE, CHUNK_LOAD_RADIUS, TILE_SIZE, TileType, BLOCKING_TILES, WATER_LEVEL, tileTypeFromRgb } from '@projectrs/shared';
-import type { MapMeta } from '@projectrs/shared';
+import { CHUNK_SIZE, CHUNK_LOAD_RADIUS, TILE_SIZE, TileType, BLOCKING_TILES, WATER_LEVEL, tileTypeFromRgb, WallEdge } from '@projectrs/shared';
+import type { MapMeta, WallsFile } from '@projectrs/shared';
 
 // Tile colors for vertex coloring
 const TILE_COLORS: Record<TileType, Color4> = {
@@ -40,6 +40,7 @@ export class ChunkManager {
   private mapHeight: number = 0;
   private heights: Float32Array | null = null; // (width+1) * (height+1) vertices
   private tiles: Uint8Array | null = null; // width * height tiles
+  private walls: Uint8Array | null = null; // width * height wall edge bitmasks
 
   // Active chunk meshes
   private chunks: Map<string, ChunkMeshes> = new Map();
@@ -123,6 +124,23 @@ export class ChunkManager {
       const b = tData.data[i * 4 + 2];
       this.tiles[i] = tileTypeFromRgb(r, g, b);
     }
+
+    // Fetch walls data
+    this.walls = new Uint8Array(this.mapWidth * this.mapHeight);
+    try {
+      const wallsRes = await fetch(`/maps/${mapId}/walls.json${cacheBust}`);
+      if (wallsRes.ok) {
+        const wallsData: WallsFile = await wallsRes.json();
+        for (const [key, mask] of Object.entries(wallsData.walls)) {
+          const [xStr, zStr] = key.split(',');
+          const wx = parseInt(xStr);
+          const wz = parseInt(zStr);
+          if (wx >= 0 && wx < this.mapWidth && wz >= 0 && wz < this.mapHeight) {
+            this.walls[wz * this.mapWidth + wx] = mask;
+          }
+        }
+      }
+    } catch { /* walls.json doesn't exist yet — no walls */ }
 
     // Create shared materials
     if (!this.groundMat) {
@@ -313,6 +331,8 @@ export class ChunkManager {
   }
 
   private buildWallMesh(chunkX: number, chunkZ: number, startX: number, startZ: number, endX: number, endZ: number): Mesh | null {
+    if (!this.walls) return null;
+
     const positions: number[] = [];
     const indices: number[] = [];
     const normals: number[] = [];
@@ -320,20 +340,13 @@ export class ChunkManager {
     let vertexIndex = 0;
     let hasWalls = false;
 
-    const baseColor = TILE_COLORS[TileType.WALL];
+    const WALL_THICKNESS = 0.1; // thin wall
+    const cr = 0.35, cg = 0.30, cb = 0.30;
 
     for (let x = startX; x < endX; x++) {
       for (let z = startZ; z < endZ; z++) {
-        if (this.getTileTypeRaw(x, z) !== TileType.WALL) continue;
-        // Only build 3D walls for tiles that look like building perimeters
-        // Check if this wall tile has non-wall neighbors (edge detection)
-        const hasNonWallNeighbor =
-          this.getTileTypeRaw(x - 1, z) !== TileType.WALL ||
-          this.getTileTypeRaw(x + 1, z) !== TileType.WALL ||
-          this.getTileTypeRaw(x, z - 1) !== TileType.WALL ||
-          this.getTileTypeRaw(x, z + 1) !== TileType.WALL;
-        if (!hasNonWallNeighbor) continue;
-
+        const mask = this.getWallRaw(x, z);
+        if (mask === 0) continue;
         hasWalls = true;
 
         const x0 = x * TILE_SIZE;
@@ -341,49 +354,98 @@ export class ChunkManager {
         const z0 = z * TILE_SIZE;
         const z1 = (z + 1) * TILE_SIZE;
 
-        const y00 = this.getVertexHeight(x, z);
-        const y10 = this.getVertexHeight(x + 1, z);
-        const y11 = this.getVertexHeight(x + 1, z + 1);
-        const y01 = this.getVertexHeight(x, z + 1);
-
-        const yt00 = y00 + WALL_HEIGHT;
-        const yt10 = y10 + WALL_HEIGHT;
-        const yt11 = y11 + WALL_HEIGHT;
-        const yt01 = y01 + WALL_HEIGHT;
-
-        const variation = Math.sin(x * 3.7 + z * 2.3) * 0.03;
-        const cr = baseColor.r + variation;
-        const cg = baseColor.g + variation;
-        const cb = baseColor.b + variation;
-
-        // Top face
-        positions.push(x0, yt00, z0, x1, yt10, z0, x1, yt11, z1, x0, yt01, z1);
-        for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
-        indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
-        vertexIndex += 4;
-
-        // Side faces — only if neighbor isn't also a wall
-        if (this.getTileTypeRaw(x - 1, z) !== TileType.WALL) {
-          positions.push(x0, y00, z0, x0, y01, z1, x0, yt01, z1, x0, yt00, z0);
-          for (let i = 0; i < 4; i++) { normals.push(-1, 0, 0); colors.push(cr - 0.03, cg - 0.03, cb - 0.03, 1); }
-          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
-          vertexIndex += 4;
-        }
-        if (this.getTileTypeRaw(x + 1, z) !== TileType.WALL) {
-          positions.push(x1, y10, z0, x1, yt10, z0, x1, yt11, z1, x1, y11, z1);
-          for (let i = 0; i < 4; i++) { normals.push(1, 0, 0); colors.push(cr - 0.03, cg - 0.03, cb - 0.03, 1); }
-          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
-          vertexIndex += 4;
-        }
-        if (this.getTileTypeRaw(x, z - 1) !== TileType.WALL) {
-          positions.push(x0, y00, z0, x0, yt00, z0, x1, yt10, z0, x1, y10, z0);
+        // North edge (z = z0) — wall from (x0,z0) to (x1,z0)
+        if (mask & WallEdge.N) {
+          const yL = this.getVertexHeight(x, z);
+          const yR = this.getVertexHeight(x + 1, z);
+          const ytL = yL + WALL_HEIGHT;
+          const ytR = yR + WALL_HEIGHT;
+          // Front face (facing -Z)
+          positions.push(x0, yL, z0, x0, ytL, z0, x1, ytR, z0, x1, yR, z0);
           for (let i = 0; i < 4; i++) { normals.push(0, 0, -1); colors.push(cr, cg, cb, 1); }
           indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
           vertexIndex += 4;
+          // Back face (facing +Z)
+          const zb = z0 + WALL_THICKNESS;
+          positions.push(x1, yR, zb, x1, ytR, zb, x0, ytL, zb, x0, yL, zb);
+          for (let i = 0; i < 4; i++) { normals.push(0, 0, 1); colors.push(cr - 0.05, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          // Top face
+          positions.push(x0, ytL, z0, x0, ytL, zb, x1, ytR, zb, x1, ytR, z0);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
         }
-        if (this.getTileTypeRaw(x, z + 1) !== TileType.WALL) {
-          positions.push(x1, y11, z1, x1, yt11, z1, x0, yt01, z1, x0, y01, z1);
+
+        // South edge (z = z1) — wall from (x0,z1) to (x1,z1)
+        if (mask & WallEdge.S) {
+          const yL = this.getVertexHeight(x, z + 1);
+          const yR = this.getVertexHeight(x + 1, z + 1);
+          const ytL = yL + WALL_HEIGHT;
+          const ytR = yR + WALL_HEIGHT;
+          const zf = z1 - WALL_THICKNESS;
+          // Front face (facing +Z)
+          positions.push(x1, yR, z1, x1, ytR, z1, x0, ytL, z1, x0, yL, z1);
           for (let i = 0; i < 4; i++) { normals.push(0, 0, 1); colors.push(cr, cg, cb, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          // Back face (facing -Z)
+          positions.push(x0, yL, zf, x0, ytL, zf, x1, ytR, zf, x1, yR, zf);
+          for (let i = 0; i < 4; i++) { normals.push(0, 0, -1); colors.push(cr - 0.05, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          // Top face
+          positions.push(x0, ytL, zf, x0, ytL, z1, x1, ytR, z1, x1, ytR, zf);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+
+        // East edge (x = x1) — wall from (x1,z0) to (x1,z1)
+        if (mask & WallEdge.E) {
+          const yT = this.getVertexHeight(x + 1, z);
+          const yB = this.getVertexHeight(x + 1, z + 1);
+          const ytT = yT + WALL_HEIGHT;
+          const ytB = yB + WALL_HEIGHT;
+          // Front face (facing +X)
+          positions.push(x1, yT, z0, x1, ytT, z0, x1, ytB, z1, x1, yB, z1);
+          for (let i = 0; i < 4; i++) { normals.push(1, 0, 0); colors.push(cr - 0.03, cg - 0.03, cb - 0.03, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          // Back face (facing -X)
+          const xb = x1 - WALL_THICKNESS;
+          positions.push(xb, yB, z1, xb, ytB, z1, xb, ytT, z0, xb, yT, z0);
+          for (let i = 0; i < 4; i++) { normals.push(-1, 0, 0); colors.push(cr - 0.05, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          // Top face
+          positions.push(xb, ytT, z0, x1, ytT, z0, x1, ytB, z1, xb, ytB, z1);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+        }
+
+        // West edge (x = x0) — wall from (x0,z0) to (x0,z1)
+        if (mask & WallEdge.W) {
+          const yT = this.getVertexHeight(x, z);
+          const yB = this.getVertexHeight(x, z + 1);
+          const ytT = yT + WALL_HEIGHT;
+          const ytB = yB + WALL_HEIGHT;
+          // Front face (facing -X)
+          positions.push(x0, yB, z1, x0, ytB, z1, x0, ytT, z0, x0, yT, z0);
+          for (let i = 0; i < 4; i++) { normals.push(-1, 0, 0); colors.push(cr - 0.03, cg - 0.03, cb - 0.03, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          // Back face (facing +X)
+          const xb = x0 + WALL_THICKNESS;
+          positions.push(xb, yT, z0, xb, ytT, z0, xb, ytB, z1, xb, yB, z1);
+          for (let i = 0; i < 4; i++) { normals.push(1, 0, 0); colors.push(cr - 0.05, cg - 0.05, cb - 0.05, 1); }
+          indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
+          vertexIndex += 4;
+          // Top face
+          positions.push(x0, ytT, z0, xb, ytT, z0, xb, ytB, z1, x0, ytB, z1);
+          for (let i = 0; i < 4; i++) { normals.push(0, 1, 0); colors.push(cr + 0.05, cg + 0.05, cb + 0.05, 1); }
           indices.push(vertexIndex, vertexIndex + 1, vertexIndex + 2, vertexIndex, vertexIndex + 2, vertexIndex + 3);
           vertexIndex += 4;
         }
@@ -447,6 +509,46 @@ export class ChunkManager {
     return BLOCKING_TILES.has(this.getTileType(x, z));
   }
 
+  private getWallRaw(x: number, z: number): number {
+    if (!this.walls) return 0;
+    if (x < 0 || x >= this.mapWidth || z < 0 || z >= this.mapHeight) return 0;
+    return this.walls[z * this.mapWidth + x];
+  }
+
+  isWallBlocked(fromX: number, fromZ: number, toX: number, toZ: number): boolean {
+    const fx = Math.floor(fromX);
+    const fz = Math.floor(fromZ);
+    const tx = Math.floor(toX);
+    const tz = Math.floor(toZ);
+    const dx = tx - fx;
+    const dz = tz - fz;
+
+    if (dx === 0 && dz === -1) return (this.getWallRaw(fx, fz) & WallEdge.N) !== 0;
+    if (dx === 1 && dz === 0) return (this.getWallRaw(fx, fz) & WallEdge.E) !== 0;
+    if (dx === 0 && dz === 1) return (this.getWallRaw(fx, fz) & WallEdge.S) !== 0;
+    if (dx === -1 && dz === 0) return (this.getWallRaw(fx, fz) & WallEdge.W) !== 0;
+
+    // Diagonal
+    if (dx === 1 && dz === -1) {
+      return (this.getWallRaw(fx, fz) & WallEdge.N) !== 0 || (this.getWallRaw(fx, fz) & WallEdge.E) !== 0
+          || (this.getWallRaw(tx, tz) & WallEdge.S) !== 0 || (this.getWallRaw(tx, tz) & WallEdge.W) !== 0;
+    }
+    if (dx === -1 && dz === -1) {
+      return (this.getWallRaw(fx, fz) & WallEdge.N) !== 0 || (this.getWallRaw(fx, fz) & WallEdge.W) !== 0
+          || (this.getWallRaw(tx, tz) & WallEdge.S) !== 0 || (this.getWallRaw(tx, tz) & WallEdge.E) !== 0;
+    }
+    if (dx === 1 && dz === 1) {
+      return (this.getWallRaw(fx, fz) & WallEdge.S) !== 0 || (this.getWallRaw(fx, fz) & WallEdge.E) !== 0
+          || (this.getWallRaw(tx, tz) & WallEdge.N) !== 0 || (this.getWallRaw(tx, tz) & WallEdge.W) !== 0;
+    }
+    if (dx === -1 && dz === 1) {
+      return (this.getWallRaw(fx, fz) & WallEdge.S) !== 0 || (this.getWallRaw(fx, fz) & WallEdge.W) !== 0
+          || (this.getWallRaw(tx, tz) & WallEdge.N) !== 0 || (this.getWallRaw(tx, tz) & WallEdge.E) !== 0;
+    }
+
+    return false;
+  }
+
   /** Get tile data for minimap rendering (windowed view) */
   getTilesForMinimap(centerX: number, centerZ: number, radius: number): { tiles: Uint8Array; size: number; startX: number; startZ: number } {
     const size = radius * 2;
@@ -486,6 +588,7 @@ export class ChunkManager {
     this.chunks.clear();
     this.heights = null;
     this.tiles = null;
+    this.walls = null;
     this.loaded = false;
     this.lastChunkX = -999;
     this.lastChunkZ = -999;

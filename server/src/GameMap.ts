@@ -1,8 +1,8 @@
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import { PNG } from 'pngjs';
-import { CHUNK_SIZE, TileType, BLOCKING_TILES, tileTypeFromRgb } from '@projectrs/shared';
-import type { MapMeta, MapTransition } from '@projectrs/shared';
+import { CHUNK_SIZE, TileType, BLOCKING_TILES, tileTypeFromRgb, WallEdge } from '@projectrs/shared';
+import type { MapMeta, MapTransition, WallsFile } from '@projectrs/shared';
 
 const MAPS_DIR = resolve(import.meta.dir, '../data/maps');
 
@@ -19,6 +19,8 @@ export class GameMap {
   private heights: Float32Array;
   /** Tile types (width x height) */
   private tiles: Uint8Array;
+  /** Wall edge bitmasks per tile (width x height) */
+  private walls: Uint8Array;
 
   private minH: number;
   private maxH: number;
@@ -64,6 +66,21 @@ export class GameMap {
       this.tiles[i] = tileTypeFromRgb(r, g, b);
     }
 
+    // Load walls
+    this.walls = new Uint8Array(this.width * this.height);
+    const wallsPath = resolve(dir, 'walls.json');
+    if (existsSync(wallsPath)) {
+      const wallsData: WallsFile = JSON.parse(readFileSync(wallsPath, 'utf-8'));
+      for (const [key, mask] of Object.entries(wallsData.walls)) {
+        const [xStr, zStr] = key.split(',');
+        const x = parseInt(xStr);
+        const z = parseInt(zStr);
+        if (x >= 0 && x < this.width && z >= 0 && z < this.height) {
+          this.walls[z * this.width + x] = mask;
+        }
+      }
+    }
+
     console.log(`Loaded map '${mapId}': ${this.width}x${this.height} tiles, height range [${this.minH}, ${this.maxH}]`);
   }
 
@@ -107,6 +124,48 @@ export class GameMap {
     const tz = Math.floor(z);
     if (tx < 0 || tx >= this.width || tz < 0 || tz >= this.height) return TileType.WALL;
     return this.tiles[tz * this.width + tx] as TileType;
+  }
+
+  getWall(x: number, z: number): number {
+    if (x < 0 || x >= this.width || z < 0 || z >= this.height) return 0;
+    return this.walls[z * this.width + x];
+  }
+
+  /** Check if movement from (fromX,fromZ) to (toX,toZ) is blocked by a wall edge */
+  isWallBlocked(fromX: number, fromZ: number, toX: number, toZ: number): boolean {
+    const fx = Math.floor(fromX);
+    const fz = Math.floor(fromZ);
+    const tx = Math.floor(toX);
+    const tz = Math.floor(toZ);
+
+    const dx = tx - fx;
+    const dz = tz - fz;
+
+    // Cardinal movement
+    if (dx === 0 && dz === -1) return (this.getWall(fx, fz) & WallEdge.N) !== 0;
+    if (dx === 1 && dz === 0) return (this.getWall(fx, fz) & WallEdge.E) !== 0;
+    if (dx === 0 && dz === 1) return (this.getWall(fx, fz) & WallEdge.S) !== 0;
+    if (dx === -1 && dz === 0) return (this.getWall(fx, fz) & WallEdge.W) !== 0;
+
+    // Diagonal movement — blocked if either of the two edges that would be crossed has a wall
+    if (dx === 1 && dz === -1) {  // NE
+      return (this.getWall(fx, fz) & WallEdge.N) !== 0 || (this.getWall(fx, fz) & WallEdge.E) !== 0
+          || (this.getWall(tx, tz) & WallEdge.S) !== 0 || (this.getWall(tx, tz) & WallEdge.W) !== 0;
+    }
+    if (dx === -1 && dz === -1) { // NW
+      return (this.getWall(fx, fz) & WallEdge.N) !== 0 || (this.getWall(fx, fz) & WallEdge.W) !== 0
+          || (this.getWall(tx, tz) & WallEdge.S) !== 0 || (this.getWall(tx, tz) & WallEdge.E) !== 0;
+    }
+    if (dx === 1 && dz === 1) {   // SE
+      return (this.getWall(fx, fz) & WallEdge.S) !== 0 || (this.getWall(fx, fz) & WallEdge.E) !== 0
+          || (this.getWall(tx, tz) & WallEdge.N) !== 0 || (this.getWall(tx, tz) & WallEdge.W) !== 0;
+    }
+    if (dx === -1 && dz === 1) {  // SW
+      return (this.getWall(fx, fz) & WallEdge.S) !== 0 || (this.getWall(fx, fz) & WallEdge.W) !== 0
+          || (this.getWall(tx, tz) & WallEdge.N) !== 0 || (this.getWall(tx, tz) & WallEdge.E) !== 0;
+    }
+
+    return false;
   }
 
   findSpawnPoint(): { x: number; z: number } {
@@ -229,10 +288,15 @@ export class GameMap {
       closed.add(ck);
 
       const dirs: [number, number][] = [[-1, 0], [1, 0], [0, -1], [0, 1]];
-      if (!this.isBlocked(current.x - 1, current.z) && !this.isBlocked(current.x, current.z - 1)) dirs.push([-1, -1]);
-      if (!this.isBlocked(current.x + 1, current.z) && !this.isBlocked(current.x, current.z - 1)) dirs.push([1, -1]);
-      if (!this.isBlocked(current.x - 1, current.z) && !this.isBlocked(current.x, current.z + 1)) dirs.push([-1, 1]);
-      if (!this.isBlocked(current.x + 1, current.z) && !this.isBlocked(current.x, current.z + 1)) dirs.push([1, 1]);
+      // Diagonal: allowed only if both cardinal neighbors are passable AND no wall edges block
+      const canW = !this.isBlocked(current.x - 1, current.z) && !this.isWallBlocked(current.x, current.z, current.x - 1, current.z);
+      const canE = !this.isBlocked(current.x + 1, current.z) && !this.isWallBlocked(current.x, current.z, current.x + 1, current.z);
+      const canN = !this.isBlocked(current.x, current.z - 1) && !this.isWallBlocked(current.x, current.z, current.x, current.z - 1);
+      const canS = !this.isBlocked(current.x, current.z + 1) && !this.isWallBlocked(current.x, current.z, current.x, current.z + 1);
+      if (canW && canN) dirs.push([-1, -1]);
+      if (canE && canN) dirs.push([1, -1]);
+      if (canW && canS) dirs.push([-1, 1]);
+      if (canE && canS) dirs.push([1, 1]);
 
       for (const [dx, dz] of dirs) {
         const nx = current.x + dx;
@@ -241,6 +305,7 @@ export class GameMap {
         if (closed.has(nk)) continue;
         if (nx < 0 || nx >= w || nz < 0 || nz >= h) continue;
         if (this.isBlocked(nx, nz)) continue;
+        if (this.isWallBlocked(current.x, current.z, nx, nz)) continue;
 
         const isDiag = dx !== 0 && dz !== 0;
         const g = current.g + (isDiag ? 1.414 : 1);

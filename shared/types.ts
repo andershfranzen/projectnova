@@ -95,6 +95,17 @@ export enum TileType {
 
 export const BLOCKING_TILES = new Set([TileType.WATER, TileType.WALL]);
 
+// --- Edge-based wall system ---
+
+/** Bitmask for wall edges on a tile. Multiple edges can be combined with |. */
+export const WallEdge = { N: 1, E: 2, S: 4, W: 8 } as const;
+export type WallEdgeMask = number; // 0-15 bitmask
+
+/** On-disk format for walls.json — sparse, only tiles with walls */
+export interface WallsFile {
+  walls: Record<string, number>; // "x,z" -> bitmask
+}
+
 // --- World object definition ---
 
 export interface WorldObjectDef {

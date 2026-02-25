@@ -62,6 +62,31 @@ export class World {
     this.chunkManagers.set(mapId, new ServerChunkManager(gameMap.width, gameMap.height));
   }
 
+  reloadMap(mapId: string): void {
+    console.log(`Hot-reloading map '${mapId}'...`);
+    const gameMap = new GameMap(mapId);
+    this.maps.set(mapId, gameMap);
+    // Recreate chunk manager but preserve entity registrations
+    this.chunkManagers.set(mapId, new ServerChunkManager(gameMap.width, gameMap.height));
+    // Re-register entities that are on this map
+    for (const [id, player] of this.players) {
+      if (player.currentMapLevel === mapId) {
+        this.chunkManagers.get(mapId)!.addEntity(id, player.position.x, player.position.y);
+      }
+    }
+    for (const [id, npc] of this.npcs) {
+      if (npc.currentMapLevel === mapId) {
+        this.chunkManagers.get(mapId)!.addEntity(id, npc.position.x, npc.position.y);
+      }
+    }
+    for (const [id, obj] of this.worldObjects) {
+      if (obj.currentMapLevel === mapId) {
+        this.chunkManagers.get(mapId)!.addEntity(id, obj.position.x, obj.position.y);
+      }
+    }
+    console.log(`Map '${mapId}' reloaded: ${gameMap.width}x${gameMap.height}`);
+  }
+
   getMap(mapId: string): GameMap {
     const m = this.maps.get(mapId);
     if (!m) throw new Error(`Unknown map: ${mapId}`);
@@ -266,9 +291,13 @@ export class World {
 
     const map = this.getPlayerMap(player);
     const validPath: { x: number; z: number }[] = [];
+    let prevX = player.position.x;
+    let prevZ = player.position.y;
     for (const step of path) {
-      if (!map.isBlocked(step.x, step.z)) {
+      if (!map.isBlocked(step.x, step.z) && !map.isWallBlocked(prevX, prevZ, step.x, step.z)) {
         validPath.push(step);
+        prevX = step.x;
+        prevZ = step.z;
       } else {
         break;
       }
@@ -566,7 +595,10 @@ export class World {
         }
       }
 
-      npc.processAI((x, z) => map.isBlocked(x, z));
+      npc.processAI(
+        (x, z) => map.isBlocked(x, z),
+        (fx, fz, tx, tz) => map.isWallBlocked(fx, fz, tx, tz)
+      );
 
       // Update NPC chunk position
       const cm = this.chunkManagers.get(npc.currentMapLevel);
@@ -601,12 +633,13 @@ export class World {
         const npcTileZ = Math.floor(npc.position.y);
         const wouldOverlap = (px: number, pz: number) =>
           Math.floor(px) === npcTileX && Math.floor(pz) === npcTileZ;
-        if (sx !== 0 && sz !== 0 && !map.isBlocked(nx, nz) && !wouldOverlap(nx, nz)) {
+        const px = player.position.x, py = player.position.y;
+        if (sx !== 0 && sz !== 0 && !map.isBlocked(nx, nz) && !wouldOverlap(nx, nz) && !map.isWallBlocked(px, py, nx, nz)) {
           player.position.x = nx;
           player.position.y = nz;
-        } else if (sx !== 0 && !map.isBlocked(player.position.x + sx, player.position.y) && !wouldOverlap(player.position.x + sx, player.position.y)) {
+        } else if (sx !== 0 && !map.isBlocked(px + sx, py) && !wouldOverlap(px + sx, py) && !map.isWallBlocked(px, py, px + sx, py)) {
           player.position.x += sx;
-        } else if (sz !== 0 && !map.isBlocked(player.position.x, player.position.y + sz) && !wouldOverlap(player.position.x, player.position.y + sz)) {
+        } else if (sz !== 0 && !map.isBlocked(px, py + sz) && !wouldOverlap(px, py + sz) && !map.isWallBlocked(px, py, px, py + sz)) {
           player.position.y += sz;
         }
       }

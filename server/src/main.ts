@@ -1,6 +1,8 @@
 import { SERVER_PORT, GAME_WS_PATH, CHAT_WS_PATH } from '@projectrs/shared';
 import { resolve } from 'path';
-import { statSync, readFileSync } from 'fs';
+import { statSync, readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { PNG } from 'pngjs';
+import { TILEMAP_COLORS, type TileType } from '@projectrs/shared';
 import { World } from './World';
 import { GameDatabase } from './Database';
 import {
@@ -149,8 +151,15 @@ const server = Bun.serve<SocketData>({
 
     // --- Data Assets ---
 
-    if (url.pathname === '/data/objects.json') {
-      const filePath = resolve(import.meta.dir, '../data/objects.json');
+    if (url.pathname.startsWith('/data/') && url.pathname.endsWith('.json')) {
+      const filename = url.pathname.slice(6); // remove '/data/'
+      if (filename.includes('/') || filename.includes('..')) {
+        return new Response('Forbidden', { status: 403 });
+      }
+      const filePath = resolve(import.meta.dir, '../data', filename);
+      if (!filePath.startsWith(resolve(import.meta.dir, '../data'))) {
+        return new Response('Forbidden', { status: 403 });
+      }
       try {
         const content = readFileSync(filePath);
         return new Response(content, {
@@ -161,6 +170,242 @@ const server = Bun.serve<SocketData>({
         });
       } catch {
         return new Response('Not Found', { status: 404 });
+      }
+    }
+
+    // --- Editor API ---
+
+    if (url.pathname === '/api/editor/maps' && req.method === 'GET') {
+      try {
+        const entries = readdirSync(MAPS_DIR, { withFileTypes: true });
+        const maps = entries
+          .filter(e => e.isDirectory())
+          .map(e => {
+            try {
+              const meta = JSON.parse(readFileSync(resolve(MAPS_DIR, e.name, 'meta.json'), 'utf-8'));
+              return { id: meta.id, name: meta.name, width: meta.width, height: meta.height };
+            } catch {
+              return { id: e.name, name: e.name, width: 0, height: 0 };
+            }
+          });
+        return jsonResponse({ ok: true, maps });
+      } catch {
+        return jsonResponse({ ok: false, error: 'Failed to list maps' }, 500);
+      }
+    }
+
+    if (url.pathname === '/api/editor/save-map' && req.method === 'POST') {
+      try {
+        const body = await req.json() as {
+          mapId: string;
+          meta: any;
+          spawns: any;
+          tilemap: number[];
+          heightmap: number[];
+          walls?: Record<string, number>;
+        };
+        const { mapId, meta, spawns, tilemap, heightmap, walls } = body;
+        if (!mapId || !meta || !tilemap || !heightmap) {
+          return jsonResponse({ ok: false, error: 'Missing fields' }, 400);
+        }
+        const mapDir = resolve(MAPS_DIR, mapId);
+        if (!mapDir.startsWith(MAPS_DIR)) {
+          return new Response('Forbidden', { status: 403 });
+        }
+
+        // Encode tilemap PNG
+        const tw = meta.width;
+        const th = meta.height;
+        const tilePng = new PNG({ width: tw, height: th, colorType: 2 });
+        for (let i = 0; i < tw * th; i++) {
+          const tileType = tilemap[i] as TileType;
+          const color = TILEMAP_COLORS[tileType] || TILEMAP_COLORS[0];
+          const idx = i * 4;
+          tilePng.data[idx] = color.r;
+          tilePng.data[idx + 1] = color.g;
+          tilePng.data[idx + 2] = color.b;
+          tilePng.data[idx + 3] = 255;
+        }
+        const tileBuffer = PNG.sync.write(tilePng);
+
+        // Encode heightmap PNG
+        const vw = tw + 1;
+        const vh = th + 1;
+        const heightPng = new PNG({ width: vw, height: vh, colorType: 0 });
+        for (let i = 0; i < vw * vh; i++) {
+          const val = Math.max(0, Math.min(255, heightmap[i]));
+          const idx = i * 4;
+          heightPng.data[idx] = val;
+          heightPng.data[idx + 1] = val;
+          heightPng.data[idx + 2] = val;
+          heightPng.data[idx + 3] = 255;
+        }
+        const heightBuffer = PNG.sync.write(heightPng);
+
+        // Write all files
+        writeFileSync(resolve(mapDir, 'meta.json'), JSON.stringify(meta, null, 2));
+        writeFileSync(resolve(mapDir, 'spawns.json'), JSON.stringify(spawns, null, 2));
+        writeFileSync(resolve(mapDir, 'tilemap.png'), tileBuffer);
+        writeFileSync(resolve(mapDir, 'heightmap.png'), heightBuffer);
+
+        // Write walls.json (sparse format)
+        if (walls) {
+          writeFileSync(resolve(mapDir, 'walls.json'), JSON.stringify({ walls }, null, 2));
+        }
+
+        return jsonResponse({ ok: true });
+      } catch (e: any) {
+        return jsonResponse({ ok: false, error: e.message || 'Save failed' }, 500);
+      }
+    }
+
+    if (url.pathname === '/api/editor/new-map' && req.method === 'POST') {
+      try {
+        const body = await req.json() as { mapId: string; name: string; width: number; height: number };
+        const { mapId, name, width, height } = body;
+        if (!mapId || !name || !width || !height) {
+          return jsonResponse({ ok: false, error: 'Missing fields' }, 400);
+        }
+        if (width < 32 || width > 2048 || height < 32 || height > 2048) {
+          return jsonResponse({ ok: false, error: 'Dimensions must be 32-2048' }, 400);
+        }
+        const mapDir = resolve(MAPS_DIR, mapId);
+        if (!mapDir.startsWith(MAPS_DIR)) {
+          return new Response('Forbidden', { status: 403 });
+        }
+        try { statSync(mapDir); return jsonResponse({ ok: false, error: 'Map already exists' }, 400); } catch {}
+
+        mkdirSync(mapDir, { recursive: true });
+
+        // Default meta
+        const meta = {
+          id: mapId,
+          name,
+          width,
+          height,
+          heightRange: [-2, 10] as [number, number],
+          waterLevel: -0.3,
+          spawnPoint: { x: Math.floor(width / 2) + 0.5, z: Math.floor(height / 2) + 0.5 },
+          fogColor: [0.4, 0.6, 0.9] as [number, number, number],
+          fogStart: 30,
+          fogEnd: 50,
+          transitions: [],
+        };
+
+        // All-grass tilemap
+        const tilePng = new PNG({ width, height, colorType: 2 });
+        const grass = TILEMAP_COLORS[0];
+        for (let i = 0; i < width * height; i++) {
+          const idx = i * 4;
+          tilePng.data[idx] = grass.r;
+          tilePng.data[idx + 1] = grass.g;
+          tilePng.data[idx + 2] = grass.b;
+          tilePng.data[idx + 3] = 255;
+        }
+
+        // Flat heightmap (mid-range = 128)
+        const vw = width + 1;
+        const vh = height + 1;
+        const heightPng = new PNG({ width: vw, height: vh, colorType: 0 });
+        for (let i = 0; i < vw * vh; i++) {
+          const idx = i * 4;
+          heightPng.data[idx] = 128;
+          heightPng.data[idx + 1] = 128;
+          heightPng.data[idx + 2] = 128;
+          heightPng.data[idx + 3] = 255;
+        }
+
+        writeFileSync(resolve(mapDir, 'meta.json'), JSON.stringify(meta, null, 2));
+        writeFileSync(resolve(mapDir, 'spawns.json'), JSON.stringify({ npcs: [], objects: [] }, null, 2));
+        writeFileSync(resolve(mapDir, 'tilemap.png'), PNG.sync.write(tilePng));
+        writeFileSync(resolve(mapDir, 'heightmap.png'), PNG.sync.write(heightPng));
+        writeFileSync(resolve(mapDir, 'walls.json'), JSON.stringify({ walls: {} }, null, 2));
+
+        return jsonResponse({ ok: true, meta });
+      } catch (e: any) {
+        return jsonResponse({ ok: false, error: e.message || 'Create failed' }, 500);
+      }
+    }
+
+    if (url.pathname === '/api/editor/reload-map' && req.method === 'POST') {
+      try {
+        const body = await req.json() as { mapId: string };
+        const { mapId } = body;
+        if (!mapId) return jsonResponse({ ok: false, error: 'Missing mapId' }, 400);
+        const mapDir = resolve(MAPS_DIR, mapId);
+        if (!mapDir.startsWith(MAPS_DIR)) return new Response('Forbidden', { status: 403 });
+
+        // Reload the map in the world (re-read PNGs and JSON from disk)
+        try {
+          world.reloadMap(mapId);
+          return jsonResponse({ ok: true });
+        } catch (e: any) {
+          return jsonResponse({ ok: false, error: e.message }, 500);
+        }
+      } catch {
+        return jsonResponse({ ok: false, error: 'Invalid request' }, 400);
+      }
+    }
+
+    if (url.pathname === '/api/editor/export-map' && req.method === 'GET') {
+      const mapId = url.searchParams.get('mapId');
+      if (!mapId) return jsonResponse({ ok: false, error: 'Missing mapId' }, 400);
+      const mapDir = resolve(MAPS_DIR, mapId);
+      if (!mapDir.startsWith(MAPS_DIR)) return new Response('Forbidden', { status: 403 });
+
+      try {
+        const files: Record<string, Uint8Array | string> = {};
+        for (const fname of ['meta.json', 'spawns.json', 'tilemap.png', 'heightmap.png']) {
+          files[fname] = readFileSync(resolve(mapDir, fname));
+        }
+        // Simple tar-like format: JSON with base64 blobs
+        const exportFiles: Record<string, string> = {
+          'meta.json': readFileSync(resolve(mapDir, 'meta.json'), 'utf-8'),
+          'spawns.json': readFileSync(resolve(mapDir, 'spawns.json'), 'utf-8'),
+          'tilemap.png': Buffer.from(readFileSync(resolve(mapDir, 'tilemap.png'))).toString('base64'),
+          'heightmap.png': Buffer.from(readFileSync(resolve(mapDir, 'heightmap.png'))).toString('base64'),
+        };
+        const wallsPath = resolve(mapDir, 'walls.json');
+        if (existsSync(wallsPath)) {
+          exportFiles['walls.json'] = readFileSync(wallsPath, 'utf-8');
+        }
+        const exported = { mapId, files: exportFiles };
+        return new Response(JSON.stringify(exported), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Disposition': `attachment; filename="${mapId}.json"`,
+          },
+        });
+      } catch {
+        return jsonResponse({ ok: false, error: 'Export failed' }, 500);
+      }
+    }
+
+    if (url.pathname === '/api/editor/import-map' && req.method === 'POST') {
+      try {
+        const formData = await req.formData();
+        const file = formData.get('file') as File;
+        if (!file) return jsonResponse({ ok: false, error: 'No file' }, 400);
+        const text = await file.text();
+        const data = JSON.parse(text);
+        const mapId = data.mapId;
+        if (!mapId || !data.files) return jsonResponse({ ok: false, error: 'Invalid format' }, 400);
+
+        const mapDir = resolve(MAPS_DIR, mapId);
+        if (!mapDir.startsWith(MAPS_DIR)) return new Response('Forbidden', { status: 403 });
+        mkdirSync(mapDir, { recursive: true });
+
+        writeFileSync(resolve(mapDir, 'meta.json'), data.files['meta.json']);
+        writeFileSync(resolve(mapDir, 'spawns.json'), data.files['spawns.json']);
+        writeFileSync(resolve(mapDir, 'tilemap.png'), Buffer.from(data.files['tilemap.png'], 'base64'));
+        writeFileSync(resolve(mapDir, 'heightmap.png'), Buffer.from(data.files['heightmap.png'], 'base64'));
+        if (data.files['walls.json']) {
+          writeFileSync(resolve(mapDir, 'walls.json'), data.files['walls.json']);
+        }
+
+        return jsonResponse({ ok: true, mapId });
+      } catch (e: any) {
+        return jsonResponse({ ok: false, error: e.message || 'Import failed' }, 500);
       }
     }
 
