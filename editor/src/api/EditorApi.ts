@@ -1,4 +1,4 @@
-import { tileTypeFromRgb, type MapMeta, type SpawnsFile, type NpcDef, type WorldObjectDef, type WallsFile } from '@projectrs/shared';
+import { tileTypeFromRgb, type MapMeta, type SpawnsFile, type NpcDef, type WorldObjectDef, type WallsFile, type StairData, type RoofData } from '@projectrs/shared';
 
 export interface MapListEntry {
   id: string;
@@ -13,6 +13,10 @@ export interface LoadedMap {
   tiles: Uint8Array;   // width * height tile types
   heights: Uint8Array;  // (width+1) * (height+1) pixel values
   walls: Uint8Array;   // width * height wall edge bitmasks
+  wallHeights: Map<number, number>;    // sparse: tileIdx -> height
+  floors: Map<number, number>;         // sparse: tileIdx -> floor height
+  stairs: Map<number, StairData>;      // sparse: tileIdx -> stair data
+  roofs: Map<number, RoofData>;        // sparse: tileIdx -> roof data
 }
 
 export class EditorApi {
@@ -83,10 +87,33 @@ export class EditorApi {
       }
     } catch { /* no walls.json yet */ }
 
-    return { meta, spawns, tiles, heights, walls };
+    // Load building data from walls.json
+    const wallHeights = new Map<number, number>();
+    const floors = new Map<number, number>();
+    const stairs = new Map<number, StairData>();
+    const roofs = new Map<number, RoofData>();
+    try {
+      const wallsRes2 = await fetch(`/maps/${mapId}/walls.json?t=${Date.now()}`);
+      if (wallsRes2.ok) {
+        const wd: WallsFile = await wallsRes2.json();
+        const parseIdx = (key: string): number | null => {
+          const [xs, zs] = key.split(',');
+          const x = parseInt(xs), z = parseInt(zs);
+          if (x >= 0 && x < meta.width && z >= 0 && z < meta.height) return z * meta.width + x;
+          return null;
+        };
+        if (wd.wallHeights) for (const [k, v] of Object.entries(wd.wallHeights)) { const i = parseIdx(k); if (i !== null) wallHeights.set(i, v); }
+        if (wd.floors) for (const [k, v] of Object.entries(wd.floors)) { const i = parseIdx(k); if (i !== null) floors.set(i, v); }
+        if (wd.stairs) for (const [k, v] of Object.entries(wd.stairs)) { const i = parseIdx(k); if (i !== null) stairs.set(i, v); }
+        if (wd.roofs) for (const [k, v] of Object.entries(wd.roofs)) { const i = parseIdx(k); if (i !== null) roofs.set(i, v); }
+      }
+    } catch { /* ok */ }
+
+    return { meta, spawns, tiles, heights, walls, wallHeights, floors, stairs, roofs };
   }
 
-  async saveMap(mapId: string, meta: MapMeta, spawns: SpawnsFile, tiles: Uint8Array, heights: Uint8Array, walls: Uint8Array): Promise<void> {
+  async saveMap(mapId: string, map: LoadedMap): Promise<void> {
+    const { meta, spawns, tiles, heights, walls } = map;
     // Convert walls Uint8Array to sparse format
     const wallsObj: Record<string, number> = {};
     for (let z = 0; z < meta.height; z++) {
@@ -98,6 +125,17 @@ export class EditorApi {
       }
     }
 
+    // Convert sparse Maps to "x,z" keyed objects
+    const toSparse = <T>(m: Map<number, T>): Record<string, T> => {
+      const out: Record<string, T> = {};
+      for (const [idx, v] of m) {
+        const x = idx % meta.width;
+        const z = Math.floor(idx / meta.width);
+        out[`${x},${z}`] = v;
+      }
+      return out;
+    };
+
     const res = await fetch('/api/editor/save-map', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -108,6 +146,10 @@ export class EditorApi {
         tilemap: Array.from(tiles),
         heightmap: Array.from(heights),
         walls: wallsObj,
+        wallHeights: map.wallHeights.size > 0 ? toSparse(map.wallHeights) : undefined,
+        floors: map.floors.size > 0 ? toSparse(map.floors) : undefined,
+        stairs: map.stairs.size > 0 ? toSparse(map.stairs) : undefined,
+        roofs: map.roofs.size > 0 ? toSparse(map.roofs) : undefined,
       }),
     });
     const data = await res.json();

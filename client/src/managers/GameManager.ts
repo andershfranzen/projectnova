@@ -238,7 +238,7 @@ export class GameManager {
   }
 
   private getHeight(x: number, z: number): number {
-    return this.chunkManager.getInterpolatedHeight(x, z);
+    return this.chunkManager.getEffectiveHeight(x, z);
   }
 
   private applyFog(): void {

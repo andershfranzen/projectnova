@@ -1,8 +1,8 @@
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import { PNG } from 'pngjs';
-import { CHUNK_SIZE, TileType, BLOCKING_TILES, tileTypeFromRgb, WallEdge } from '@projectrs/shared';
-import type { MapMeta, MapTransition, WallsFile } from '@projectrs/shared';
+import { CHUNK_SIZE, TileType, BLOCKING_TILES, tileTypeFromRgb, WallEdge, DEFAULT_WALL_HEIGHT } from '@projectrs/shared';
+import type { MapMeta, MapTransition, WallsFile, StairData, RoofData } from '@projectrs/shared';
 
 const MAPS_DIR = resolve(import.meta.dir, '../data/maps');
 
@@ -21,6 +21,14 @@ export class GameMap {
   private tiles: Uint8Array;
   /** Wall edge bitmasks per tile (width x height) */
   private walls: Uint8Array;
+  /** Per-tile wall height overrides (sparse — only stores non-default) */
+  private wallHeights: Map<number, number> = new Map();
+  /** Elevated floor heights (sparse) */
+  private floorHeights: Map<number, number> = new Map();
+  /** Stair data (sparse) */
+  private stairs: Map<number, StairData> = new Map();
+  /** Roof data (sparse) */
+  private roofs: Map<number, RoofData> = new Map();
 
   private minH: number;
   private maxH: number;
@@ -66,17 +74,44 @@ export class GameMap {
       this.tiles[i] = tileTypeFromRgb(r, g, b);
     }
 
-    // Load walls
+    // Load walls and building data
     this.walls = new Uint8Array(this.width * this.height);
     const wallsPath = resolve(dir, 'walls.json');
     if (existsSync(wallsPath)) {
       const wallsData: WallsFile = JSON.parse(readFileSync(wallsPath, 'utf-8'));
-      for (const [key, mask] of Object.entries(wallsData.walls)) {
+      const parseKey = (key: string): [number, number] | null => {
         const [xStr, zStr] = key.split(',');
         const x = parseInt(xStr);
         const z = parseInt(zStr);
-        if (x >= 0 && x < this.width && z >= 0 && z < this.height) {
-          this.walls[z * this.width + x] = mask;
+        if (x >= 0 && x < this.width && z >= 0 && z < this.height) return [x, z];
+        return null;
+      };
+      for (const [key, mask] of Object.entries(wallsData.walls)) {
+        const coords = parseKey(key);
+        if (coords) this.walls[coords[1] * this.width + coords[0]] = mask;
+      }
+      if (wallsData.wallHeights) {
+        for (const [key, h] of Object.entries(wallsData.wallHeights)) {
+          const coords = parseKey(key);
+          if (coords) this.wallHeights.set(coords[1] * this.width + coords[0], h);
+        }
+      }
+      if (wallsData.floors) {
+        for (const [key, h] of Object.entries(wallsData.floors)) {
+          const coords = parseKey(key);
+          if (coords) this.floorHeights.set(coords[1] * this.width + coords[0], h);
+        }
+      }
+      if (wallsData.stairs) {
+        for (const [key, data] of Object.entries(wallsData.stairs)) {
+          const coords = parseKey(key);
+          if (coords) this.stairs.set(coords[1] * this.width + coords[0], data);
+        }
+      }
+      if (wallsData.roofs) {
+        for (const [key, data] of Object.entries(wallsData.roofs)) {
+          const coords = parseKey(key);
+          if (coords) this.roofs.set(coords[1] * this.width + coords[0], data);
         }
       }
     }
@@ -129,6 +164,61 @@ export class GameMap {
   getWall(x: number, z: number): number {
     if (x < 0 || x >= this.width || z < 0 || z >= this.height) return 0;
     return this.walls[z * this.width + x];
+  }
+
+  getWallHeight(x: number, z: number): number {
+    const idx = z * this.width + x;
+    return this.wallHeights.get(idx) ?? DEFAULT_WALL_HEIGHT;
+  }
+
+  getFloorHeight(x: number, z: number): number | null {
+    const tx = Math.floor(x);
+    const tz = Math.floor(z);
+    if (tx < 0 || tx >= this.width || tz < 0 || tz >= this.height) return null;
+    return this.floorHeights.get(tz * this.width + tx) ?? null;
+  }
+
+  getStair(x: number, z: number): StairData | null {
+    const tx = Math.floor(x);
+    const tz = Math.floor(z);
+    if (tx < 0 || tx >= this.width || tz < 0 || tz >= this.height) return null;
+    return this.stairs.get(tz * this.width + tx) ?? null;
+  }
+
+  getRoof(x: number, z: number): RoofData | null {
+    const tx = Math.floor(x);
+    const tz = Math.floor(z);
+    if (tx < 0 || tx >= this.width || tz < 0 || tz >= this.height) return null;
+    return this.roofs.get(tz * this.width + tx) ?? null;
+  }
+
+  /** Get effective walking height at a position, accounting for floors and stairs */
+  getEffectiveHeight(x: number, z: number): number {
+    const tx = Math.floor(x);
+    const tz = Math.floor(z);
+
+    // Check for stair
+    const stair = this.getStair(tx, tz);
+    if (stair) {
+      // Interpolate height based on position within tile along stair direction
+      const fx = x - tx; // 0-1 fractional position within tile
+      const fz = z - tz;
+      let t: number;
+      switch (stair.direction) {
+        case 'N': t = 1 - fz; break; // walking north = decreasing z = going up
+        case 'S': t = fz; break;
+        case 'E': t = fx; break;
+        case 'W': t = 1 - fx; break;
+      }
+      return stair.baseHeight + t * (stair.topHeight - stair.baseHeight);
+    }
+
+    // Check for elevated floor
+    const floor = this.getFloorHeight(x, z);
+    if (floor !== null) return floor;
+
+    // Default: terrain height
+    return this.getInterpolatedHeight(x, z);
   }
 
   /** Check if movement from (fromX,fromZ) to (toX,toZ) is blocked by a wall edge */

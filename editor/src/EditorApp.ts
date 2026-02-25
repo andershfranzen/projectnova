@@ -249,6 +249,10 @@ export class EditorApp {
       s.tiles = data.tiles;
       s.heights = data.heights;
       s.walls = data.walls;
+      s.wallHeights = data.wallHeights;
+      s.floors = data.floors;
+      s.stairs = data.stairs;
+      s.roofs = data.roofs;
       s.dirty = false;
       s.selection = null;
 
@@ -274,7 +278,10 @@ export class EditorApp {
     if (!s.mapId) { showToast('No map loaded', true); return; }
 
     try {
-      await this.api.saveMap(s.mapId, s.meta, s.spawns, s.tiles, s.heights, s.walls);
+      await this.api.saveMap(s.mapId, {
+        meta: s.meta, spawns: s.spawns, tiles: s.tiles, heights: s.heights, walls: s.walls,
+        wallHeights: s.wallHeights, floors: s.floors, stairs: s.stairs, roofs: s.roofs,
+      });
       s.dirty = false;
       showToast('Map saved');
     } catch (e: any) {

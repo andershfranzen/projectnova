@@ -101,9 +101,34 @@ export const BLOCKING_TILES = new Set([TileType.WATER, TileType.WALL]);
 export const WallEdge = { N: 1, E: 2, S: 4, W: 8 } as const;
 export type WallEdgeMask = number; // 0-15 bitmask
 
-/** On-disk format for walls.json — sparse, only tiles with walls */
+/** Default wall height when not overridden */
+export const DEFAULT_WALL_HEIGHT = 1.8;
+
+/** Roof styles */
+export type RoofStyle = 'flat' | 'peaked_ns' | 'peaked_ew';
+
+/** Stair direction — the direction you walk to go UP */
+export type StairDirection = 'N' | 'E' | 'S' | 'W';
+
+export interface StairData {
+  direction: StairDirection;
+  baseHeight: number;   // floor height at bottom of stairs
+  topHeight: number;    // floor height at top of stairs
+}
+
+export interface RoofData {
+  height: number;       // Y level of roof plane
+  style: RoofStyle;
+  peakHeight?: number;  // extra height for peaked roofs (above height)
+}
+
+/** On-disk format for walls.json — sparse, only tiles with walls/roofs/floors/stairs */
 export interface WallsFile {
-  walls: Record<string, number>; // "x,z" -> bitmask
+  walls: Record<string, number>;              // "x,z" -> edge bitmask
+  wallHeights?: Record<string, number>;       // "x,z" -> wall top height (default 1.8 above floor)
+  roofs?: Record<string, RoofData>;           // "x,z" -> roof data
+  floors?: Record<string, number>;            // "x,z" -> elevated floor height
+  stairs?: Record<string, StairData>;         // "x,z" -> stair data
 }
 
 // --- World object definition ---

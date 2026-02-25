@@ -1,4 +1,4 @@
-import type { MapMeta, SpawnsFile, SpawnEntry, ObjectSpawnEntry, NpcDef, WorldObjectDef } from '@projectrs/shared';
+import type { MapMeta, SpawnsFile, SpawnEntry, ObjectSpawnEntry, NpcDef, WorldObjectDef, StairData, RoofData } from '@projectrs/shared';
 
 export type EditorTool = 'tile' | 'height' | 'npc' | 'object' | 'eraser' | 'eyedropper' | 'fill' | 'rect' | 'line' | 'select' | 'wall';
 export type HeightMode = 'set' | 'raise' | 'lower' | 'smooth';
@@ -19,6 +19,10 @@ export interface EditorState {
   tiles: Uint8Array;    // width * height
   heights: Uint8Array;  // (width+1) * (height+1)
   walls: Uint8Array;    // width * height wall edge bitmasks
+  wallHeights: Map<number, number>;    // sparse: tileIdx -> wall height override
+  floors: Map<number, number>;         // sparse: tileIdx -> elevated floor height
+  stairs: Map<number, StairData>;      // sparse: tileIdx -> stair data
+  roofs: Map<number, RoofData>;        // sparse: tileIdx -> roof data
 
   // Tool state
   activeTool: EditorTool;
@@ -62,6 +66,10 @@ export function createInitialState(): EditorState {
     tiles: new Uint8Array(0),
     heights: new Uint8Array(0),
     walls: new Uint8Array(0),
+    wallHeights: new Map(),
+    floors: new Map(),
+    stairs: new Map(),
+    roofs: new Map(),
 
     activeTool: 'tile',
     selectedTileType: 0,
