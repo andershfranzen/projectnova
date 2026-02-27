@@ -20,19 +20,21 @@ export interface DirectionalSpriteSet {
 }
 
 /**
- * Animation sprite set — 4 cardinal directions x N frames.
- * Used for attack animations etc. West mirrors East.
+ * Animation sprite set — 4 cardinal or 8 directional x N frames.
+ * Used for attack/walk animations. West mirrors East for 4-cardinal sets.
  */
 export interface AnimationSpriteSet {
-  /** materials[cardinalIndex][frameIndex] — 4 cardinal dirs x N frames */
+  /** materials[dirIndex][frameIndex] — 4 or 8 dirs x N frames */
   materials: StandardMaterial[][];
   /** Number of frames per direction */
   frameCount: number;
-  /** Whether the W direction should mirror (flip X scale) */
+  /** Whether the W direction should mirror (flip X scale) — for 4-dir sets */
   mirrorW: boolean;
   /** Mesh scale factors to match idle sprite pixel density (set after loading) */
   meshScaleX: number;
   meshScaleY: number;
+  /** Per-direction mirror flags for 8-dir sets (indexed by DIR_S..DIR_SW) */
+  mirrored8?: boolean[];
 }
 
 /** Direction indices */
@@ -171,6 +173,57 @@ export async function loadAnimationSprites(
 }
 
 /**
+ * Load animation sprites for 8 directions x N frames.
+ * Expects: basePath/{south,south-east,east,...}/frame_000.png .. frame_{N-1}.png.
+ * Missing directions fall back to mirrored counterparts.
+ */
+export async function load8DirAnimationSprites(
+  scene: Scene, basePath: string, name: string, frameCount: number
+): Promise<AnimationSpriteSet> {
+  const dirNames = ['south', 'south-east', 'east', 'north-east', 'north', 'north-west', 'west', 'south-west'];
+  const materials: StandardMaterial[][] = [];
+  const loaded: boolean[] = [];
+
+  for (let d = 0; d < dirNames.length; d++) {
+    const dirMats: StandardMaterial[] = [];
+    let dirLoaded = false;
+    for (let f = 0; f < frameCount; f++) {
+      const frameStr = String(f).padStart(3, '0');
+      const filePath = `${basePath}/${dirNames[d]}/frame_${frameStr}.png`;
+      const mat = await new Promise<StandardMaterial>((resolve) => {
+        const tex = new Texture(
+          filePath, scene, false, true, Texture.NEAREST_SAMPLINGMODE,
+          () => { tex.hasAlpha = true; dirLoaded = true; resolve(makeMat()); },
+          () => { resolve(makeMat()); }
+        );
+        function makeMat(): StandardMaterial {
+          const m = new StandardMaterial(`${name}_8anim_${dirNames[d]}_${f}`, scene);
+          if (tex.isReady()) m.diffuseTexture = tex;
+          m.useAlphaFromDiffuseTexture = true;
+          m.specularColor = new Color3(0, 0, 0);
+          m.emissiveColor = new Color3(0.3, 0.3, 0.3);
+          m.backFaceCulling = false;
+          return m;
+        }
+      });
+      dirMats.push(mat);
+    }
+    materials.push(dirMats);
+    loaded.push(dirLoaded);
+  }
+
+  // Fallback mirroring: NW←NE, W←E, SW←SE (if those dirs didn't load)
+  const mirrored8 = [false, false, false, false, false, false, false, false];
+  // DIR_NW=5 mirrors DIR_NE=3, DIR_W=6 mirrors DIR_E=2, DIR_SW=7 mirrors DIR_SE=1
+  if (!loaded[DIR_NW]) { materials[DIR_NW] = materials[DIR_NE]; mirrored8[DIR_NW] = true; }
+  if (!loaded[DIR_W])  { materials[DIR_W]  = materials[DIR_E];  mirrored8[DIR_W]  = true; }
+  if (!loaded[DIR_SW]) { materials[DIR_SW] = materials[DIR_SE]; mirrored8[DIR_SW] = true; }
+  if (!loaded[DIR_N] && loaded[DIR_NE]) { materials[DIR_N] = materials[DIR_NE]; }
+
+  return { materials, frameCount, mirrorW: false, meshScaleX: 1, meshScaleY: 1, mirrored8 };
+}
+
+/**
  * Compute which of 8 direction indices to use based on camera-to-entity angle.
  * Returns 0-7 (S, SE, E, NE, N, NW, W, SW).
  */
@@ -254,13 +307,22 @@ export class SpriteEntity {
   private dirSprites: DirectionalSpriteSet | null = null;
   private currentDirIndex: number = -1;
 
-  // Attack animation
-  private attackAnim: AnimationSpriteSet | null = null;
-  private animPlaying: boolean = false;
-  private animCardinalIndex: number = 0;
-  private animFrameIndex: number = 0;
-  private animFrameTimer: number = 0;
-  private animFrameDuration: number = 0.125; // 125ms per frame
+  // Attack animations (named map + default)
+  private defaultAttackAnim: AnimationSpriteSet | null = null;
+  private attackAnims: Map<string, AnimationSpriteSet> = new Map();
+  private activeAttackAnim: AnimationSpriteSet | null = null;
+  private attackPlaying: boolean = false;
+  private attackDirIndex: number = 0;
+  private attackFrameIndex: number = 0;
+  private attackFrameTimer: number = 0;
+  private attackFrameDuration: number = 0.125; // 125ms per frame
+
+  // Walk animation (8-directional looping)
+  private walkAnim: AnimationSpriteSet | null = null;
+  private walkPlaying: boolean = false;
+  private walkFrameIndex: number = 0;
+  private walkFrameTimer: number = 0;
+  private walkFrameDuration: number = 0.15; // 150ms per frame
 
   // Health bar (HTML overlay)
   private healthBarEl: HTMLDivElement | null = null;
@@ -336,56 +398,138 @@ export class SpriteEntity {
     this.plane.material = sprites.materials[DIR_S];
   }
 
-  /** Attach an attack animation sprite set (call once after loading) */
+  /** Attach a default attack animation sprite set (backwards compat for NPCs) */
   setAttackAnimation(anim: AnimationSpriteSet): void {
-    this.attackAnim = anim;
+    this.defaultAttackAnim = anim;
   }
 
-  /** Start playing the attack animation based on current facing direction */
-  playAttackAnimation(): void {
-    if (!this.attackAnim) return;
-    this.animCardinalIndex = DIR_TO_CARDINAL[this.currentDirIndex >= 0 ? this.currentDirIndex : DIR_S];
-    this.animFrameIndex = 0;
-    this.animFrameTimer = 0;
-    this.animPlaying = true;
-    // Set first frame material
-    this.plane.material = this.attackAnim.materials[this.animCardinalIndex][0];
-    // Scale mesh to preserve pixel density (attack canvas may differ from idle)
-    const mirror = this.animCardinalIndex === CARD_W && this.attackAnim.mirrorW;
-    this.plane.scaling.x = (mirror ? -1 : 1) * this.baseScaleX * this.attackAnim.meshScaleX;
-    this.plane.scaling.y = this.attackAnim.meshScaleY;
-    // Shift Y so feet stay grounded (scale expands from center, push center up)
-    this.plane.position.y = this._position.y + this.yOffset * this.attackAnim.meshScaleY;
+  /** Add a named attack animation (e.g. 'punch', 'kick', 'sword') */
+  addAttackAnimation(name: string, anim: AnimationSpriteSet): void {
+    this.attackAnims.set(name, anim);
+  }
+
+  /** Attach a walk animation sprite set (8-directional looping) */
+  setWalkAnimation(anim: AnimationSpriteSet): void {
+    this.walkAnim = anim;
+  }
+
+  /** Start looping the walk animation */
+  startWalking(): void {
+    if (!this.walkAnim || this.walkPlaying) return;
+    this.walkPlaying = true;
+    this.walkFrameIndex = 0;
+    this.walkFrameTimer = 0;
+    if (!this.attackPlaying) {
+      this.applyWalkFrame();
+    }
+  }
+
+  /** Stop the walk animation, restore idle sprite */
+  stopWalking(): void {
+    if (!this.walkPlaying) return;
+    this.walkPlaying = false;
+    if (!this.attackPlaying) {
+      this.restoreIdleSprite();
+    }
+  }
+
+  isWalking(): boolean {
+    return this.walkPlaying;
+  }
+
+  /** Helper: get the direction index into an AnimationSpriteSet's materials array */
+  private getAnimDirIndex(anim: AnimationSpriteSet): number {
+    const dir = this.currentDirIndex >= 0 ? this.currentDirIndex : DIR_S;
+    // 8-dir anim: use direction index directly; 4-dir: map to cardinal
+    return anim.materials.length === 8 ? dir : DIR_TO_CARDINAL[dir];
+  }
+
+  /** Helper: check if a given direction should be mirrored for this anim */
+  private getAnimMirror(anim: AnimationSpriteSet, dirIndex: number): boolean {
+    if (anim.materials.length === 8 && anim.mirrored8) {
+      return anim.mirrored8[dirIndex];
+    }
+    return dirIndex === CARD_W && anim.mirrorW;
+  }
+
+  /** Apply the current walk frame material */
+  private applyWalkFrame(): void {
+    if (!this.walkAnim) return;
+    const dirIdx = this.getAnimDirIndex(this.walkAnim);
+    this.plane.material = this.walkAnim.materials[dirIdx][this.walkFrameIndex];
+    const mirror = this.getAnimMirror(this.walkAnim, dirIdx);
+    this.plane.scaling.x = (mirror ? -1 : 1) * this.baseScaleX * this.walkAnim.meshScaleX;
+    this.plane.scaling.y = this.walkAnim.meshScaleY;
+    this.plane.position.y = this._position.y + this.yOffset * this.walkAnim.meshScaleY;
+  }
+
+  /** Restore idle directional sprite (no animation playing) */
+  private restoreIdleSprite(): void {
+    this.plane.scaling.y = 1;
+    this.plane.position.y = this._position.y + this.yOffset;
+    if (this.dirSprites && this.currentDirIndex >= 0) {
+      this.plane.material = this.dirSprites.materials[this.currentDirIndex];
+      this.plane.scaling.x = this.dirSprites.mirrored[this.currentDirIndex] ? -this.baseScaleX : this.baseScaleX;
+    } else {
+      this.plane.scaling.x = this.baseScaleX;
+    }
+  }
+
+  /** Start playing an attack animation. Name selects from named anims; omit for default. */
+  playAttackAnimation(name?: string): void {
+    const anim = name ? this.attackAnims.get(name) : (this.defaultAttackAnim ?? this.attackAnims.values().next().value);
+    if (!anim) return;
+    this.activeAttackAnim = anim;
+    this.attackDirIndex = this.getAnimDirIndex(anim);
+    this.attackFrameIndex = 0;
+    this.attackFrameTimer = 0;
+    this.attackPlaying = true;
+    // Set first frame
+    this.plane.material = anim.materials[this.attackDirIndex][0];
+    const mirror = this.getAnimMirror(anim, this.attackDirIndex);
+    this.plane.scaling.x = (mirror ? -1 : 1) * this.baseScaleX * anim.meshScaleX;
+    this.plane.scaling.y = anim.meshScaleY;
+    this.plane.position.y = this._position.y + this.yOffset * anim.meshScaleY;
   }
 
   /** Advance animation timer. Call every frame with delta time in seconds. */
   updateAnimation(dt: number): void {
-    if (!this.animPlaying || !this.attackAnim) return;
-    this.animFrameTimer += dt;
-    if (this.animFrameTimer >= this.animFrameDuration) {
-      this.animFrameTimer -= this.animFrameDuration;
-      this.animFrameIndex++;
-      if (this.animFrameIndex >= this.attackAnim.frameCount) {
-        // Animation finished — restore idle material and mesh scale
-        this.animPlaying = false;
-        this.plane.scaling.y = 1;
-        this.plane.position.y = this._position.y + this.yOffset;
-        if (this.dirSprites && this.currentDirIndex >= 0) {
-          this.plane.material = this.dirSprites.materials[this.currentDirIndex];
-          this.plane.scaling.x = this.dirSprites.mirrored[this.currentDirIndex] ? -this.baseScaleX : this.baseScaleX;
-        } else {
-          this.plane.scaling.x = this.baseScaleX;
+    // Attack animation takes priority
+    if (this.attackPlaying && this.activeAttackAnim) {
+      this.attackFrameTimer += dt;
+      if (this.attackFrameTimer >= this.attackFrameDuration) {
+        this.attackFrameTimer -= this.attackFrameDuration;
+        this.attackFrameIndex++;
+        if (this.attackFrameIndex >= this.activeAttackAnim.frameCount) {
+          // Attack finished
+          this.attackPlaying = false;
+          this.activeAttackAnim = null;
+          if (this.walkPlaying) {
+            this.applyWalkFrame();
+          } else {
+            this.restoreIdleSprite();
+          }
+          return;
         }
-        return;
+        this.plane.material = this.activeAttackAnim.materials[this.attackDirIndex][this.attackFrameIndex];
       }
-      // Advance to next frame
-      this.plane.material = this.attackAnim.materials[this.animCardinalIndex][this.animFrameIndex];
+      return;
+    }
+
+    // Walk animation loops while walkPlaying
+    if (this.walkPlaying && this.walkAnim) {
+      this.walkFrameTimer += dt;
+      if (this.walkFrameTimer >= this.walkFrameDuration) {
+        this.walkFrameTimer -= this.walkFrameDuration;
+        this.walkFrameIndex = (this.walkFrameIndex + 1) % this.walkAnim.frameCount;
+        this.applyWalkFrame();
+      }
     }
   }
 
-  /** Whether an animation is currently playing */
+  /** Whether an attack animation is currently playing */
   isAnimating(): boolean {
-    return this.animPlaying;
+    return this.attackPlaying;
   }
 
   /**
@@ -393,13 +537,16 @@ export class SpriteEntity {
    * Call each frame for entities with directional sprites.
    */
   updateDirection(cameraPos: Vector3): void {
-    if (!this.dirSprites || this.animPlaying) return;
+    if (!this.dirSprites || this.attackPlaying) return;
     const idx = getDirectionIndex(cameraPos, this._position);
     if (idx === this.currentDirIndex) return;
     this.currentDirIndex = idx;
-    this.plane.material = this.dirSprites.materials[idx];
-    // Mirror for W/SW/NW directions
-    this.plane.scaling.x = this.dirSprites.mirrored[idx] ? -this.baseScaleX : this.baseScaleX;
+    if (this.walkPlaying && this.walkAnim) {
+      this.applyWalkFrame();
+    } else {
+      this.plane.material = this.dirSprites.materials[idx];
+      this.plane.scaling.x = this.dirSprites.mirrored[idx] ? -this.baseScaleX : this.baseScaleX;
+    }
   }
 
   /**
@@ -407,13 +554,17 @@ export class SpriteEntity {
    * Only updates if the entity is actually moving (dx/dz non-zero).
    */
   updateMovementDirection(dx: number, dz: number, cameraPos: Vector3): void {
-    if (!this.dirSprites || this.animPlaying) return;
-    if (Math.abs(dx) < 0.001 && Math.abs(dz) < 0.001) return; // not moving, keep last direction
+    if (!this.dirSprites || this.attackPlaying) return;
+    if (Math.abs(dx) < 0.001 && Math.abs(dz) < 0.001) return;
     const idx = getMovementDirectionIndex(dx, dz, cameraPos, this._position);
     if (idx === this.currentDirIndex) return;
     this.currentDirIndex = idx;
-    this.plane.material = this.dirSprites.materials[idx];
-    this.plane.scaling.x = this.dirSprites.mirrored[idx] ? -this.baseScaleX : this.baseScaleX;
+    if (this.walkPlaying && this.walkAnim) {
+      this.applyWalkFrame();
+    } else {
+      this.plane.material = this.dirSprites.materials[idx];
+      this.plane.scaling.x = this.dirSprites.mirrored[idx] ? -this.baseScaleX : this.baseScaleX;
+    }
   }
 
   /**
@@ -421,15 +572,19 @@ export class SpriteEntity {
    * Uses the same screen-space projection as movement direction.
    */
   faceToward(targetPos: Vector3, cameraPos: Vector3): void {
-    if (!this.dirSprites || this.animPlaying) return;
+    if (!this.dirSprites || this.attackPlaying) return;
     const dx = targetPos.x - this._position.x;
     const dz = targetPos.z - this._position.z;
     if (Math.abs(dx) < 0.001 && Math.abs(dz) < 0.001) return;
     const idx = getMovementDirectionIndex(dx, dz, cameraPos, this._position);
     if (idx === this.currentDirIndex) return;
     this.currentDirIndex = idx;
-    this.plane.material = this.dirSprites.materials[idx];
-    this.plane.scaling.x = this.dirSprites.mirrored[idx] ? -this.baseScaleX : this.baseScaleX;
+    if (this.walkPlaying && this.walkAnim) {
+      this.applyWalkFrame();
+    } else {
+      this.plane.material = this.dirSprites.materials[idx];
+      this.plane.scaling.x = this.dirSprites.mirrored[idx] ? -this.baseScaleX : this.baseScaleX;
+    }
   }
 
   get position(): Vector3 {
@@ -440,7 +595,12 @@ export class SpriteEntity {
     this._position = pos;
     this.plane.position.x = pos.x;
     // During animation, mesh is scaled — adjust Y so feet stay grounded
-    const yScale = this.animPlaying && this.attackAnim ? this.attackAnim.meshScaleY : 1;
+    let yScale = 1;
+    if (this.attackPlaying && this.activeAttackAnim) {
+      yScale = this.activeAttackAnim.meshScaleY;
+    } else if (this.walkPlaying && this.walkAnim) {
+      yScale = this.walkAnim.meshScaleY;
+    }
     this.plane.position.y = pos.y + this.yOffset * yScale;
     this.plane.position.z = pos.z;
   }

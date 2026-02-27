@@ -519,6 +519,16 @@ export class SidePanel {
     }
   }
 
+  /** Get the current melee stance */
+  getStance(): MeleeStance {
+    return this.currentStance;
+  }
+
+  /** Get the item ID in a given equipment slot (0 = empty) */
+  getEquipItem(slotIndex: number): number {
+    return this.equipment.get(slotIndex) ?? 0;
+  }
+
   // === Equipment methods ===
 
   updateEquipSlot(slotIndex: number, itemId: number): void {

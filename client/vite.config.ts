@@ -20,6 +20,12 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:4000',
       },
+      '/maps': {
+        target: 'http://localhost:4000',
+      },
+      '/data': {
+        target: 'http://localhost:4000',
+      },
     },
   },
 });

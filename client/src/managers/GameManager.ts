@@ -11,7 +11,7 @@ import { TransformNode } from '@babylonjs/core/Meshes/transformNode';
 import '@babylonjs/loaders/glTF';
 import { ChunkManager } from '../rendering/ChunkManager';
 import { GameCamera } from '../rendering/Camera';
-import { SpriteEntity, loadDirectionalSprites, loadAnimationSprites, type DirectionalSpriteSet, type AnimationSpriteSet } from '../rendering/SpriteEntity';
+import { SpriteEntity, loadDirectionalSprites, loadAnimationSprites, load8DirAnimationSprites, type DirectionalSpriteSet, type AnimationSpriteSet } from '../rendering/SpriteEntity';
 import { InputManager } from './InputManager';
 import { NetworkManager } from './NetworkManager';
 import { findPath } from '../rendering/Pathfinding';
@@ -113,6 +113,10 @@ export class GameManager {
   private rockModelTemplate: TransformNode | null = null;
   private rockModelScale: number = 1;
   private playerSprites: DirectionalSpriteSet | null = null;
+  private playerWalkAnim: AnimationSpriteSet | null = null;
+  private playerPunchAnim: AnimationSpriteSet | null = null;
+  private playerKickAnim: AnimationSpriteSet | null = null;
+  private playerSwordAnim: AnimationSpriteSet | null = null;
   /** Per-NPC-defId directional sprite sets */
   private npcSpriteSets: Map<number, DirectionalSpriteSet> = new Map();
   /** Per-NPC-defId attack animation sprite sets */
@@ -472,6 +476,75 @@ export class GameManager {
     } catch (e) {
       console.warn('Failed to load player sprites, using fallback:', e);
     }
+
+    // Load walk animation (8-direction, 4 frames)
+    try {
+      this.playerWalkAnim = await load8DirAnimationSprites(this.scene, '/sprites/player/walk', 'player_walk', 4);
+      console.log('Player walk animation loaded');
+      if (this.localPlayer) this.localPlayer.setWalkAnimation(this.playerWalkAnim);
+      for (const [, sprite] of this.remotePlayers) sprite.setWalkAnimation(this.playerWalkAnim);
+    } catch (e) {
+      console.warn('Failed to load player walk animation:', e);
+    }
+
+    // Load punch animation (8-direction, 4 frames) — for Accurate/Defensive/Controlled stances
+    try {
+      this.playerPunchAnim = await load8DirAnimationSprites(this.scene, '/sprites/player/punch', 'player_punch', 4);
+      console.log('Player punch animation loaded');
+      this.attachPlayerAttackAnims(this.localPlayer);
+      for (const [, sprite] of this.remotePlayers) this.attachPlayerAttackAnims(sprite);
+    } catch (e) {
+      console.warn('Failed to load player punch animation:', e);
+    }
+
+    // Load kick animation (4-direction, 4 frames) — for Aggressive stance
+    try {
+      this.playerKickAnim = await loadAnimationSprites(this.scene, '/sprites/player/kick', 'player_kick', 4);
+      console.log('Player kick animation loaded');
+      this.attachPlayerAttackAnims(this.localPlayer);
+      for (const [, sprite] of this.remotePlayers) this.attachPlayerAttackAnims(sprite);
+    } catch (e) {
+      console.warn('Failed to load player kick animation:', e);
+    }
+
+    // Load sword animation (4-direction, 4 frames) — for when weapon is equipped
+    try {
+      this.playerSwordAnim = await loadAnimationSprites(this.scene, '/sprites/player/sword', 'player_sword', 4);
+      console.log('Player sword animation loaded');
+      this.attachPlayerAttackAnims(this.localPlayer);
+      for (const [, sprite] of this.remotePlayers) this.attachPlayerAttackAnims(sprite);
+    } catch (e) {
+      console.warn('Failed to load player sword animation:', e);
+    }
+  }
+
+  /** Attach all loaded player attack animations to a sprite */
+  private attachPlayerAttackAnims(sprite: SpriteEntity | null): void {
+    if (!sprite) return;
+    if (this.playerPunchAnim) sprite.addAttackAnimation('punch', this.playerPunchAnim);
+    if (this.playerKickAnim) sprite.addAttackAnimation('kick', this.playerKickAnim);
+    if (this.playerSwordAnim) sprite.addAttackAnimation('sword', this.playerSwordAnim);
+  }
+
+  /**
+   * Choose the correct attack animation name based on stance and weapon.
+   * - Weapon equipped (slot 0) → 'sword'
+   * - Aggressive stance (no weapon) → 'kick'
+   * - Accurate/Defensive/Controlled (no weapon) → 'punch'
+   * For remote players, always use 'punch' (we don't know their stance/equip).
+   */
+  private getPlayerAttackAnimName(attackerId: number): string {
+    if (attackerId === this.localPlayerId && this.sidePanel) {
+      // Check if local player has a weapon equipped (slot 0)
+      const weaponId = this.sidePanel.getEquipItem(0);
+      if (weaponId > 0) return 'sword';
+      // Check stance
+      const stance = this.sidePanel.getStance();
+      if (stance === 'aggressive') return 'kick';
+      return 'punch';
+    }
+    // Remote players: default to punch
+    return 'punch';
   }
 
   /** NPC sprite config: defId → sprite folder path + optional attack animation */
@@ -532,6 +605,8 @@ export class GameManager {
   private upgradeToDirectionalSprite(sprite: SpriteEntity): void {
     if (!this.playerSprites) return;
     sprite.setDirectionalSprites(this.playerSprites);
+    if (this.playerWalkAnim) sprite.setWalkAnimation(this.playerWalkAnim);
+    this.attachPlayerAttackAnims(sprite);
   }
 
   /** Reposition all world objects/models after heightmap loads (fixes race condition) */
@@ -772,7 +847,13 @@ export class GameManager {
         || this.remotePlayers.get(attackerId)
         || (attackerId === this.localPlayerId ? this.localPlayer : null);
       if (attackerSprite) {
-        attackerSprite.playAttackAnimation();
+        const isPlayer = attackerId === this.localPlayerId || this.remotePlayers.has(attackerId);
+        if (isPlayer) {
+          attackerSprite.playAttackAnimation(this.getPlayerAttackAnimName(attackerId));
+        } else {
+          // NPC — use default attack animation
+          attackerSprite.playAttackAnimation();
+        }
       }
 
       if (targetId === this.localPlayerId && this.localPlayer) {
@@ -990,6 +1071,7 @@ export class GameManager {
     this.playerX = newX;
     this.playerZ = newZ;
     this.path = [];
+    if (this.localPlayer) this.localPlayer.stopWalking();
     this.combatTargetId = -1;
 
     if (this.localPlayer) {
@@ -1161,6 +1243,7 @@ export class GameManager {
       if (path.length > 0) {
         this.path = path;
         this.destMarker.isVisible = false;
+        this.minimap?.clearDestination();
       }
     }
   }
@@ -1266,10 +1349,13 @@ export class GameManager {
   private createDestinationMarker(): void {
     const marker = MeshBuilder.CreateDisc('destMarker', { radius: 0.3, tessellation: 6 }, this.scene);
     marker.isVisible = false;
+    // Lay disc flat on ground (default disc normal is +Z, rotate to +Y)
+    marker.rotationQuaternion = Quaternion.RotationAxis(Vector3.Right(), -Math.PI / 2);
     const mat = new StandardMaterial('destMarkerMat', this.scene);
     mat.diffuseColor = new Color3(1, 1, 0);
     mat.emissiveColor = new Color3(0.5, 0.5, 0);
     mat.specularColor = Color3.Black();
+    mat.backFaceCulling = false;
     marker.material = mat;
     this.destMarker = marker;
   }
@@ -1285,14 +1371,17 @@ export class GameManager {
     const tz = new Vector3(0, hF - hC, d);
     // Normal = cross product (tz × tx gives upward-facing normal)
     const normal = Vector3.Cross(tz, tx).normalize();
-    // Build rotation from up vector (0,1,0) to terrain normal
+    // Base rotation: lay disc flat (disc normal +Z → +Y)
+    const baseRot = Quaternion.RotationAxis(Vector3.Right(), -Math.PI / 2);
+    // Tilt from up to terrain normal
     const up = Vector3.Up();
     const angle = Math.acos(Math.min(1, Vector3.Dot(up, normal)));
     if (angle > 0.001) {
       const axis = Vector3.Cross(up, normal).normalize();
-      this.destMarker.rotationQuaternion = Quaternion.RotationAxis(axis, angle);
+      const tilt = Quaternion.RotationAxis(axis, angle);
+      this.destMarker.rotationQuaternion = tilt.multiply(baseRot);
     } else {
-      this.destMarker.rotationQuaternion = Quaternion.Identity();
+      this.destMarker.rotationQuaternion = baseRot;
     }
   }
 
@@ -1312,13 +1401,17 @@ export class GameManager {
       this.destMarker.position.z = dest.z;
       this.alignMarkerToTerrain(dest.x, dest.z);
       this.destMarker.isVisible = true;
+      this.minimap?.setDestination(dest.x, dest.z);
       this.network.sendMove(path);
     }
   }
 
   private createHUD(): void {
     this.statsPanel = new StatsPanel();
-    this.minimap = new Minimap(150);
+    this.minimap = new Minimap(200);
+    this.minimap.setClickMoveHandler((worldX, worldZ) => {
+      this.handleGroundClick(worldX, worldZ);
+    });
   }
 
   destroy(): void {
@@ -1419,6 +1512,7 @@ export class GameManager {
             if (newPath.length > 0) {
               this.path = newPath;
               this.destMarker.isVisible = false;
+              this.minimap?.clearDestination();
             }
           }
         }
@@ -1427,12 +1521,16 @@ export class GameManager {
 
     // Move local player
     if (this.path.length > 0 && this.localPlayer) {
+      // Start walk animation when path is active
+      if (!this.localPlayer.isWalking()) this.localPlayer.startWalking();
+
       if (this.combatTargetId >= 0) {
         const npcTarget = this.npcTargets.get(this.combatTargetId);
         if (npcTarget) {
           const toDist = Math.hypot(npcTarget.x - this.playerX, npcTarget.z - this.playerZ);
           if (toDist <= 1.5) {
             this.path = [];
+            this.localPlayer.stopWalking();
             this.playerX = Math.floor(this.playerX) + 0.5;
             this.playerZ = Math.floor(this.playerZ) + 0.5;
             this.localPlayer!.position = new Vector3(this.playerX, this.getHeight(this.playerX, this.playerZ), this.playerZ);
@@ -1455,7 +1553,11 @@ export class GameManager {
           this.playerX = target.x;
           this.playerZ = target.z;
           this.path.shift();
-          if (this.path.length === 0) this.destMarker.isVisible = false;
+          if (this.path.length === 0) {
+            this.destMarker.isVisible = false;
+            this.minimap?.clearDestination();
+            this.localPlayer.stopWalking();
+          }
         } else {
           this.playerX += (dx / dist) * step;
           this.playerZ += (dz / dist) * step;
@@ -1485,6 +1587,7 @@ export class GameManager {
       const dz = target.z - c.z;
       const dist = Math.hypot(dx, dz);
       if (dist > 0.05) {
+        if (!sprite.isWalking()) sprite.startWalking();
         const camPos = this.scene.activeCamera?.position;
         if (camPos) sprite.updateMovementDirection(dx, dz, camPos);
         const step = Math.min(4.0 * dt, dist);
@@ -1492,6 +1595,7 @@ export class GameManager {
         const nz = c.z + (dz / dist) * step;
         sprite.position = new Vector3(nx, this.getHeight(nx, nz), nz);
       } else {
+        if (sprite.isWalking()) sprite.stopWalking();
         // Idle — face combat target if in combat
         const combatTarget = this.remoteCombatTargets.get(entityId);
         if (combatTarget !== undefined) {
@@ -1589,10 +1693,12 @@ export class GameManager {
       for (const [, target] of this.npcTargets) {
         npcPosArr.push(target);
       }
+      const camAlpha = this.camera.getCamera().alpha;
       this.minimap.update(
         this.playerX, this.playerZ,
         remotePosArr, npcPosArr,
-        this.chunkManager
+        this.chunkManager,
+        camAlpha
       );
     }
   }
