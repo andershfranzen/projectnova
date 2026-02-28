@@ -81,11 +81,41 @@ export class MapSelector {
       for (const map of maps) {
         const item = document.createElement('div');
         item.className = 'map-list-item';
-        item.innerHTML = `<strong>${map.name}</strong> <span style="color:#888">(${map.id}, ${map.width}x${map.height})</span>`;
-        item.addEventListener('click', () => {
+        item.style.display = 'flex';
+        item.style.alignItems = 'center';
+        item.style.justifyContent = 'space-between';
+
+        const label = document.createElement('span');
+        label.innerHTML = `<strong>${map.name}</strong> <span style="color:#888">(${map.id}, ${map.width}x${map.height})</span>`;
+        label.style.flex = '1';
+        label.style.cursor = 'pointer';
+        label.addEventListener('click', () => {
           overlay.remove();
           this.onMapSelected?.(map.id);
         });
+
+        const delBtn = document.createElement('button');
+        delBtn.textContent = 'Delete';
+        delBtn.style.marginLeft = '8px';
+        delBtn.style.background = '#8a1a1a';
+        delBtn.style.color = '#fff';
+        delBtn.style.border = 'none';
+        delBtn.style.padding = '2px 8px';
+        delBtn.style.borderRadius = '3px';
+        delBtn.style.cursor = 'pointer';
+        delBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          if (!confirm(`Delete map "${map.name}" (${map.id})? This cannot be undone.`)) return;
+          try {
+            await this.api.deleteMap(map.id);
+            item.remove();
+          } catch (err: any) {
+            alert('Delete failed: ' + err.message);
+          }
+        });
+
+        item.appendChild(label);
+        item.appendChild(delBtn);
         listDiv.appendChild(item);
       }
     } catch (e: any) {

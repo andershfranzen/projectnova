@@ -11,6 +11,7 @@ export interface ToolbarCallbacks {
   onExport: () => void;
   onImport: () => void;
   onReload: () => void;
+  on3DPreview: () => void;
 }
 
 export class Toolbar {
@@ -335,6 +336,12 @@ export class Toolbar {
     });
     wallToggle.classList.toggle('active', this.stateMgr.state.showWalls);
     this.container.appendChild(wallToggle);
+
+    const previewBtn = this.btn('3D [P]', () => this.callbacks.on3DPreview());
+    previewBtn.id = 'preview-3d-btn';
+    previewBtn.style.background = '#1a5a8a';
+    previewBtn.style.borderColor = '#2a7aaa';
+    this.container.appendChild(previewBtn);
 
     this.container.appendChild(this.sep());
 

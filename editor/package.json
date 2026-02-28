@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@projectrs/shared": "workspace:*"
+    "@projectrs/shared": "workspace:*",
+    "@babylonjs/core": "^7.0.0"
   },
   "devDependencies": {
     "vite": "^6.0.0",

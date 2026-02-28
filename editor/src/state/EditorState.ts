@@ -80,6 +80,7 @@ export interface EditorState {
   showHeights: boolean;
   showSpawns: boolean;
   showWalls: boolean;
+  show3DPreview: boolean;
 
   // Definitions
   npcDefs: NpcDef[];
@@ -136,6 +137,7 @@ export function createInitialState(): EditorState {
     showHeights: false,
     showSpawns: true,
     showWalls: true,
+    show3DPreview: false,
 
     npcDefs: [],
     objectDefs: [],

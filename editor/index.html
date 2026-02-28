@@ -35,6 +35,7 @@
     #canvas-container { flex: 1; position: relative; overflow: hidden; background: #0a0a1a; }
     #map-canvas { position: absolute; top: 0; left: 0; image-rendering: pixelated; }
     #minimap-canvas { position: absolute; top: 8px; right: 8px; border: 2px solid #0f3460; background: #000; image-rendering: pixelated; }
+    #preview-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; outline: none; display: none; }
     #coords { position: absolute; bottom: 8px; left: 8px; background: rgba(0,0,0,0.7); padding: 4px 8px; border-radius: 3px; font-size: 11px; font-family: monospace; pointer-events: none; }
 
     /* Right panel */
@@ -82,6 +83,7 @@
       <div id="left-panel"></div>
       <div id="canvas-container">
         <canvas id="map-canvas"></canvas>
+        <canvas id="preview-canvas"></canvas>
         <canvas id="minimap-canvas" width="200" height="200"></canvas>
         <div id="coords">0, 0</div>
       </div>

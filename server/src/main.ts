@@ -1,6 +1,6 @@
 import { SERVER_PORT, GAME_WS_PATH, CHAT_WS_PATH } from '@projectrs/shared';
 import { resolve } from 'path';
-import { statSync, readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { statSync, readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'fs';
 import { PNG } from 'pngjs';
 import { TILEMAP_COLORS, type TileType } from '@projectrs/shared';
 import { World } from './World';
@@ -415,6 +415,21 @@ const server = Bun.serve<SocketData>({
         return jsonResponse({ ok: true, mapId });
       } catch (e: any) {
         return jsonResponse({ ok: false, error: e.message || 'Import failed' }, 500);
+      }
+    }
+
+    if (url.pathname === '/api/editor/delete-map' && req.method === 'POST') {
+      try {
+        const body = await req.json() as { mapId: string };
+        const mapId = body.mapId;
+        if (!mapId) return jsonResponse({ ok: false, error: 'mapId required' }, 400);
+        const mapDir = resolve(MAPS_DIR, mapId);
+        if (!mapDir.startsWith(MAPS_DIR)) return new Response('Forbidden', { status: 403 });
+        if (!existsSync(mapDir)) return jsonResponse({ ok: false, error: 'Map not found' }, 404);
+        rmSync(mapDir, { recursive: true, force: true });
+        return jsonResponse({ ok: true });
+      } catch (e: any) {
+        return jsonResponse({ ok: false, error: e.message || 'Delete failed' }, 500);
       }
     }
 

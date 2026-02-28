@@ -24,6 +24,7 @@ import { FloorBrush } from './tools/FloorBrush';
 import { StairPlacer } from './tools/StairPlacer';
 import { RoofBrush } from './tools/RoofBrush';
 import type { EditorToolInterface, EditorToolContext } from './tools/BaseTool';
+import type { Preview3D } from './preview/Preview3D';
 
 const RECENT_MAPS_KEY = 'projectrs-editor-recent-maps';
 
@@ -49,6 +50,8 @@ export class EditorApp {
 
   private keysDown: Set<string> = new Set();
   private spawnDragger = new SpawnDragger();
+  private preview3d: Preview3D | null = null;
+  private _3dUpdateTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Tools
   private eyedropper = new Eyedropper();
@@ -146,7 +149,11 @@ export class EditorApp {
     };
 
     this.minimap.onClick = (wx, wz) => {
-      this.mapCanvas.centerOn(wx, wz);
+      if (this.stateMgr.state.show3DPreview && this.preview3d) {
+        this.preview3d.setCameraTarget(wx, wz);
+      } else {
+        this.mapCanvas.centerOn(wx, wz);
+      }
     };
 
     // Panels
@@ -164,6 +171,7 @@ export class EditorApp {
       onExport: () => this.exportMap(),
       onImport: () => this.importMap(),
       onReload: () => this.reloadServerMap(),
+      on3DPreview: () => this.toggle3DPreview(),
     });
 
     this.tilePalette = new TilePalette(leftPanel, this.stateMgr);
@@ -171,13 +179,24 @@ export class EditorApp {
     this.mapSelector = new MapSelector(this.api);
     this.mapSelector.onMapSelected = (mapId) => this.loadMap(mapId);
 
-    this.stateMgr.onChange(() => this.mapCanvas.requestRender());
+    this.stateMgr.onChange(() => {
+      this.mapCanvas.requestRender();
+      if (this.preview3d?.isActive()) {
+        this.schedule3DUpdate();
+      }
+    });
 
     // Keyboard
     this.keysDown = new Set();
     window.addEventListener('keydown', (e) => this.handleKeyDown(e));
-    window.addEventListener('keyup', (e) => this.keysDown.delete(e.key));
-    window.addEventListener('blur', () => this.keysDown.clear());
+    window.addEventListener('keyup', (e) => {
+      this.keysDown.delete(e.key);
+      if (this.preview3d) this.preview3d.handleKeyUp(e.key);
+    });
+    window.addEventListener('blur', () => {
+      this.keysDown.clear();
+      if (this.preview3d) this.preview3d.clearKeys();
+    });
 
     // Unsaved changes warning
     window.addEventListener('beforeunload', (e) => {
@@ -186,6 +205,11 @@ export class EditorApp {
         e.returnValue = '';
       }
     });
+
+    // Resize 3D preview when container resizes
+    new ResizeObserver(() => {
+      if (this.preview3d?.isActive()) this.preview3d.resize();
+    }).observe(container);
 
     // Dismiss context menu on click
     window.addEventListener('click', () => this.dismissContextMenu());
@@ -314,6 +338,92 @@ export class EditorApp {
     } catch (e: any) {
       showToast('Reload failed: ' + e.message, true);
     }
+  }
+
+  // --- 3D Preview ---
+
+  private async toggle3DPreview(): Promise<void> {
+    const s = this.stateMgr.state;
+    s.show3DPreview = !s.show3DPreview;
+
+    const mapCanvas = document.getElementById('map-canvas') as HTMLCanvasElement;
+    const previewCanvas = document.getElementById('preview-canvas') as HTMLCanvasElement;
+    const previewBtn = document.getElementById('preview-3d-btn');
+
+    if (s.show3DPreview) {
+      if (!s.mapId) {
+        s.show3DPreview = false;
+        showToast('Load a map first', true);
+        return;
+      }
+
+      // Show 3D canvas, hide 2D
+      mapCanvas.style.display = 'none';
+      previewCanvas.style.display = 'block';
+
+      if (!this.preview3d) {
+        const { Preview3D } = await import('./preview/Preview3D');
+        this.preview3d = new Preview3D(previewCanvas);
+      }
+
+      this.preview3d.loadFromState(s);
+      this.preview3d.start();
+      this.preview3d.resize();
+
+      previewBtn?.classList.add('active');
+      this.show3DOverlay(true);
+      showToast('3D Preview — WASD to move, right-click to orbit, scroll to zoom');
+    } else {
+      // Hide 3D, show 2D
+      previewCanvas.style.display = 'none';
+      mapCanvas.style.display = 'block';
+
+      if (this.preview3d) {
+        this.preview3d.stop();
+      }
+
+      previewBtn?.classList.remove('active');
+      this.show3DOverlay(false);
+      this.mapCanvas.requestRender();
+    }
+  }
+
+  private show3DOverlay(visible: boolean): void {
+    let overlay = document.getElementById('preview-3d-overlay');
+    if (visible) {
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'preview-3d-overlay';
+        overlay.style.cssText = 'position:absolute;top:8px;left:50%;transform:translateX(-50%);display:flex;gap:6px;z-index:10;';
+
+        const fogBtn = document.createElement('button');
+        fogBtn.id = 'preview-fog-btn';
+        fogBtn.textContent = 'Fog: Off';
+        fogBtn.style.cssText = 'background:#1a3a5a;color:#fff;border:1px solid #2a5a8a;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;';
+        fogBtn.addEventListener('click', () => {
+          if (this.preview3d) {
+            this.preview3d.toggleFog();
+            fogBtn.textContent = this.preview3d.isFogEnabled() ? 'Fog: On' : 'Fog: Off';
+            fogBtn.style.background = this.preview3d.isFogEnabled() ? '#2a7a3a' : '#1a3a5a';
+          }
+        });
+        overlay.appendChild(fogBtn);
+
+        document.getElementById('canvas-container')!.appendChild(overlay);
+      }
+      overlay.style.display = 'flex';
+    } else if (overlay) {
+      overlay.style.display = 'none';
+    }
+  }
+
+  private schedule3DUpdate(): void {
+    if (this._3dUpdateTimer) clearTimeout(this._3dUpdateTimer);
+    this._3dUpdateTimer = setTimeout(() => {
+      if (this.preview3d?.isActive()) {
+        this.preview3d.refreshData(this.stateMgr.state);
+      }
+    }, 200);
   }
 
   // --- Export/Import ---
@@ -522,6 +632,7 @@ export class EditorApp {
   // --- Pan (arrow keys + WASD) ---
 
   private tickPan(): void {
+    if (this.stateMgr.state.show3DPreview) return;
     const PAN_SPEED = 400 / this.mapCanvas.zoom;
     const dt = 1 / 60;
     let dx = 0, dz = 0;
@@ -542,6 +653,11 @@ export class EditorApp {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return;
 
     this.keysDown.add(e.key);
+
+    // Forward to 3D camera if preview is active
+    if (this.stateMgr.state.show3DPreview && this.preview3d) {
+      this.preview3d.handleKeyDown(e.key);
+    }
 
     if (e.key.startsWith('Arrow')) {
       e.preventDefault();
@@ -579,6 +695,9 @@ export class EditorApp {
         break;
       case 'f': case 'F':
         this.mapCanvas.zoomToFit();
+        break;
+      case 'p': case 'P':
+        this.toggle3DPreview();
         break;
       case 'Escape':
         this.stateMgr.state.selection = null;
@@ -621,9 +740,17 @@ export class EditorApp {
     const s = this.stateMgr.state;
     if (!s.meta.width) return;
 
-    const canvas = document.getElementById('map-canvas') as HTMLCanvasElement;
-    const viewW = canvas.width / this.mapCanvas.zoom;
-    const viewH = canvas.height / this.mapCanvas.zoom;
-    this.minimap.drawViewport(this.mapCanvas.scrollX, this.mapCanvas.scrollZ, viewW, viewH, s.meta.width, s.meta.height);
+    if (s.show3DPreview && this.preview3d) {
+      // In 3D mode, center the minimap viewport on the camera target
+      const cx = this.preview3d.getCameraTargetX();
+      const cz = this.preview3d.getCameraTargetZ();
+      const viewRadius = this.preview3d.getCameraRadius();
+      this.minimap.drawViewport(cx - viewRadius, cz - viewRadius, viewRadius * 2, viewRadius * 2, s.meta.width, s.meta.height);
+    } else {
+      const canvas = document.getElementById('map-canvas') as HTMLCanvasElement;
+      const viewW = canvas.width / this.mapCanvas.zoom;
+      const viewH = canvas.height / this.mapCanvas.zoom;
+      this.minimap.drawViewport(this.mapCanvas.scrollX, this.mapCanvas.scrollZ, viewW, viewH, s.meta.width, s.meta.height);
+    }
   }
 }

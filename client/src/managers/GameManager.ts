@@ -107,6 +107,8 @@ export class GameManager {
   private worldObjectSprites: Map<number, SpriteEntity> = new Map();
   private worldObjectModels: Map<number, TransformNode> = new Map();
   private worldObjectDefs: Map<number, { defId: number; x: number; z: number; depleted: boolean }> = new Map();
+  /** Tiles blocked by non-depleted world objects (key = `${tileX},${tileZ}`) */
+  private blockedObjectTiles: Set<string> = new Set();
   private objectDefsCache: Map<number, WorldObjectDef> = new Map();
   /** Per-defId tree model templates: { template, scale } */
   private treeModels: Map<number, { template: TransformNode; scale: number }> = new Map();
@@ -279,15 +281,28 @@ export class GameManager {
       for (const def of defs) {
         this.objectDefsCache.set(def.id, def);
       }
+      // Rebuild blocked tiles for any world objects that arrived before defs loaded
+      this.rebuildBlockedObjectTiles();
     } catch (e) {
       console.warn('Failed to load object definitions:', e);
     }
   }
 
+  /** Rebuild blockedObjectTiles from all known world objects. */
+  private rebuildBlockedObjectTiles(): void {
+    this.blockedObjectTiles.clear();
+    for (const [, data] of this.worldObjectDefs) {
+      const def = this.objectDefsCache.get(data.defId);
+      if (def?.blocking && !data.depleted) {
+        this.blockedObjectTiles.add(`${Math.floor(data.x)},${Math.floor(data.z)}`);
+      }
+    }
+  }
+
   /** Tree model config: defId → GLB file + target height */
   private static readonly TREE_MODEL_CONFIG: { defId: number; file: string; targetHeight: number }[] = [
-    { defId: 1, file: 'pinetree.glb', targetHeight: 2.0 },    // Tree (level 1) — pine
-    { defId: 2, file: 'tree.glb', targetHeight: 2.5 },        // Oak Tree (level 15) — leafy oak
+    { defId: 1, file: 'tree.glb', targetHeight: 3.0 },         // Tree (level 1)
+    { defId: 2, file: 'tree.glb', targetHeight: 3.75 },       // Oak Tree (level 15)
   ];
 
   private async loadTreeModels(): Promise<void> {
@@ -338,10 +353,20 @@ export class GameManager {
     for (const child of clone.getChildMeshes()) {
       child.setEnabled(true);
       child.metadata = { objectEntityId };
+      // Force opaque — GLB leaf textures often have alpha
+      const mat = child.material as any;
+      if (mat) {
+        if (mat.transparencyMode !== undefined) mat.transparencyMode = 0;
+        mat.alpha = 1;
+        if (mat.albedoTexture) mat.albedoTexture.hasAlpha = false;
+        if (mat.diffuseTexture) mat.diffuseTexture.hasAlpha = false;
+      }
     }
     const s = model.scale;
     clone.scaling.set(s, s, s);
-    clone.position.set(x, this.getHeight(x, z), z);
+    const cx = Math.floor(x) + 0.5;
+    const cz = Math.floor(z) + 0.5;
+    clone.position.set(cx, this.getHeight(cx, cz), cz);
     this.worldObjectModels.set(objectEntityId, clone);
   }
 
@@ -878,6 +903,14 @@ export class GameManager {
       this.worldObjectDefs.set(objectEntityId, { defId: objectDefId, x, z, depleted: isDepleted });
 
       const def = this.objectDefsCache.get(objectDefId);
+
+      // Track blocking tiles for pathfinding
+      const tileKey = `${Math.floor(x)},${Math.floor(z)}`;
+      if (def?.blocking && !isDepleted) {
+        this.blockedObjectTiles.add(tileKey);
+      } else {
+        this.blockedObjectTiles.delete(tileKey);
+      }
       const isTree = def?.category === 'tree';
       const isRock = def?.category === 'rock';
       const hasTreeModel = isTree && this.treeModels.has(objectDefId);
@@ -926,6 +959,17 @@ export class GameManager {
       const [objectEntityId, isDepleted] = v;
       const data = this.worldObjectDefs.get(objectEntityId);
       if (data) data.depleted = isDepleted === 1;
+
+      // Update blocking tiles for pathfinding
+      if (data) {
+        const def2 = this.objectDefsCache.get(data.defId);
+        const tileKey = `${Math.floor(data.x)},${Math.floor(data.z)}`;
+        if (def2?.blocking && isDepleted === 0) {
+          this.blockedObjectTiles.add(tileKey);
+        } else {
+          this.blockedObjectTiles.delete(tileKey);
+        }
+      }
 
       const def = data ? this.objectDefsCache.get(data.defId) : null;
       const isRock = def?.category === 'rock';
@@ -1059,6 +1103,7 @@ export class GameManager {
     for (const [, model] of this.worldObjectModels) model.dispose();
     this.worldObjectModels.clear();
     this.worldObjectDefs.clear();
+    this.blockedObjectTiles.clear();
 
     this.isSkilling = false;
     this.skillingObjectId = -1;
@@ -1231,7 +1276,7 @@ export class GameManager {
     const target = this.npcTargets.get(npcEntityId);
     if (target) {
       const path = findPath(this.playerX, this.playerZ, target.x, target.z,
-        (x, z) => this.currentFloor === 0 ? this.chunkManager.isBlocked(x, z) : this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor),
+        this.isTileBlocked,
         this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
         (fx, fz, tx, tz) => this.currentFloor === 0 ? this.chunkManager.isWallBlocked(fx, fz, tx, tz) : this.chunkManager.isWallBlockedOnFloor(fx, fz, tx, tz, this.currentFloor));
       if (path.length > 1) {
@@ -1264,7 +1309,7 @@ export class GameManager {
     const dist = Math.hypot(dx, dz);
     if (dist > 2.0) {
       const path = findPath(this.playerX, this.playerZ, data.x, data.z,
-        (x, z) => this.currentFloor === 0 ? this.chunkManager.isBlocked(x, z) : this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor),
+        this.isTileBlocked,
         this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
         (fx, fz, tx, tz) => this.currentFloor === 0 ? this.chunkManager.isWallBlocked(fx, fz, tx, tz) : this.chunkManager.isWallBlockedOnFloor(fx, fz, tx, tz, this.currentFloor));
       if (path.length > 1) {
@@ -1385,11 +1430,19 @@ export class GameManager {
     }
   }
 
+  /** Tile blocked check that includes world objects (trees, rocks, etc.) */
+  private isTileBlocked = (x: number, z: number): boolean => {
+    if (this.currentFloor === 0) {
+      return this.chunkManager.isBlocked(x, z) || this.blockedObjectTiles.has(`${x},${z}`);
+    }
+    return this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor);
+  };
+
   private handleGroundClick(worldX: number, worldZ: number): void {
     this.combatTargetId = -1;
 
     const path = findPath(this.playerX, this.playerZ, worldX, worldZ,
-      (x, z) => this.currentFloor === 0 ? this.chunkManager.isBlocked(x, z) : this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor),
+      this.isTileBlocked,
       this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
       (fx, fz, tx, tz) => this.currentFloor === 0 ? this.chunkManager.isWallBlocked(fx, fz, tx, tz) : this.chunkManager.isWallBlockedOnFloor(fx, fz, tx, tz, this.currentFloor));
 
@@ -1500,7 +1553,7 @@ export class GameManager {
         if (dist > 1.5) {
           if (this.path.length === 0 || dist > 3) {
             const newPath = findPath(this.playerX, this.playerZ, npcTarget.x, npcTarget.z,
-              (x, z) => this.currentFloor === 0 ? this.chunkManager.isBlocked(x, z) : this.chunkManager.isBlockedOnFloor(x, z, this.currentFloor),
+              this.isTileBlocked,
               this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
               (fx, fz, tx, tz) => this.currentFloor === 0 ? this.chunkManager.isWallBlocked(fx, fz, tx, tz) : this.chunkManager.isWallBlockedOnFloor(fx, fz, tx, tz, this.currentFloor));
             if (newPath.length > 1) {

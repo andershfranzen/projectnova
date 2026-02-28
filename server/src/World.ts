@@ -32,6 +32,8 @@ export class World {
   readonly npcs: Map<number, Npc> = new Map();
   readonly groundItems: Map<number, GroundItem> = new Map();
   readonly worldObjects: Map<number, WorldObject> = new Map();
+  /** Tiles blocked by non-depleted world objects, keyed by `mapId:tileX,tileZ` */
+  private blockedObjectTiles: Set<string> = new Set();
 
   private currentTick: number = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -132,6 +134,9 @@ export class World {
         }
         const obj = new WorldObject(objDef, spawn.x, spawn.z, mapId);
         this.worldObjects.set(obj.id, obj);
+        if (objDef.blocking) {
+          this.blockedObjectTiles.add(`${mapId}:${Math.floor(spawn.x)},${Math.floor(spawn.z)}`);
+        }
       }
       console.log(`Spawned objects for map '${mapId}'`);
     }
@@ -293,9 +298,16 @@ export class World {
     const validPath: { x: number; z: number }[] = [];
     let prevX = player.position.x;
     let prevZ = player.position.y;
+    const mapId = player.currentMapLevel;
     for (const step of path) {
       const pFloor = player.currentFloor;
-      if ((pFloor === 0 ? !map.isBlocked(step.x, step.z) : !map.isTileBlockedOnFloor(Math.floor(step.x), Math.floor(step.z), pFloor)) && (pFloor === 0 ? !map.isWallBlocked(prevX, prevZ, step.x, step.z) : !map.isWallBlockedOnFloor(prevX, prevZ, step.x, step.z, pFloor))) {
+      const tileBlocked = pFloor === 0
+        ? (map.isBlocked(step.x, step.z) || this.blockedObjectTiles.has(`${mapId}:${Math.floor(step.x)},${Math.floor(step.z)}`))
+        : map.isTileBlockedOnFloor(Math.floor(step.x), Math.floor(step.z), pFloor);
+      const wallBlocked = pFloor === 0
+        ? map.isWallBlocked(prevX, prevZ, step.x, step.z)
+        : map.isWallBlockedOnFloor(prevX, prevZ, step.x, step.z, pFloor);
+      if (!tileBlocked && !wallBlocked) {
         validPath.push(step);
         prevX = step.x;
         prevZ = step.z;
@@ -819,6 +831,9 @@ export class World {
           // Roll depletion
           if (obj.def.depletionChance && Math.random() < obj.def.depletionChance) {
             obj.deplete();
+            if (obj.def.blocking) {
+              this.blockedObjectTiles.delete(`${obj.mapLevel}:${Math.floor(obj.x)},${Math.floor(obj.z)}`);
+            }
             // Notify all nearby players
             for (const [, p] of this.players) {
               if (p.currentMapLevel === obj.mapLevel && this.isNearby(p, obj.x, obj.z)) {
@@ -842,6 +857,9 @@ export class World {
     // Tick world object respawns
     for (const [, obj] of this.worldObjects) {
       if (obj.tickRespawn()) {
+        if (obj.def.blocking) {
+          this.blockedObjectTiles.add(`${obj.mapLevel}:${Math.floor(obj.x)},${Math.floor(obj.z)}`);
+        }
         // Respawned — notify nearby players
         for (const [, p] of this.players) {
           if (p.currentMapLevel === obj.mapLevel && this.isNearby(p, obj.x, obj.z)) {

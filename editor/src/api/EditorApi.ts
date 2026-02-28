@@ -257,6 +257,16 @@ export class EditorApi {
     return res.blob();
   }
 
+  async deleteMap(mapId: string): Promise<void> {
+    const res = await fetch('/api/editor/delete-map', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mapId }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error);
+  }
+
   async importMap(file: File): Promise<string> {
     const formData = new FormData();
     formData.append('file', file);
