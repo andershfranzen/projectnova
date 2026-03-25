@@ -1,8 +1,15 @@
-import { TILEMAP_COLORS } from '@projectrs/shared';
 import type { EditorState, FloorLayer } from '../state/EditorState';
 
-// Pre-compute tile colors as [r, g, b] arrays
-const TILE_RGB: [number, number, number][] = TILEMAP_COLORS.map(c => [c.r, c.g, c.b]);
+// Tile colors matching TileType enum order: GRASS, DIRT, STONE, WATER, WALL, SAND, WOOD
+const TILE_RGB: [number, number, number][] = [
+  [0x4a, 0x8a, 0x30], // GRASS
+  [0x8c, 0x68, 0x40], // DIRT
+  [0x80, 0x80, 0x80], // STONE
+  [0x30, 0x60, 0xb0], // WATER
+  [0x50, 0x40, 0x40], // WALL
+  [0xc0, 0xb0, 0x80], // SAND
+  [0x70, 0x50, 0x28], // WOOD
+];
 
 export class TileRenderer {
   private imageDataCache: ImageData | null = null;

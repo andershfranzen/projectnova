@@ -1,7 +1,9 @@
-import { TILEMAP_COLORS } from '@projectrs/shared';
 import type { EditorState } from '../state/EditorState';
 
-const TILE_RGB: [number, number, number][] = TILEMAP_COLORS.map(c => [c.r, c.g, c.b]);
+const TILE_RGB: [number, number, number][] = [
+  [0x4a, 0x8a, 0x30], [0x8c, 0x68, 0x40], [0x80, 0x80, 0x80],
+  [0x30, 0x60, 0xb0], [0x50, 0x40, 0x40], [0xc0, 0xb0, 0x80], [0x70, 0x50, 0x28],
+];
 
 export class MinimapCanvas {
   private canvas: HTMLCanvasElement;

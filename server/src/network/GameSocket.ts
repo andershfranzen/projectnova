@@ -17,8 +17,13 @@ export function handleGameSocketOpen(
   // Load saved state or use defaults
   const saved = world.db.loadPlayerState(accountId);
 
-  const spawnX = saved?.x ?? 512.5;
-  const spawnZ = saved?.z ?? 512.5;
+  // Use saved position, or map spawn point for new players
+  const mapLevel = saved?.mapLevel ?? 'overworld';
+  const map = world.getMap(mapLevel);
+  const defaultSpawn = map.findSpawnPoint();
+  const spawnX = saved ? saved.x : defaultSpawn.x;
+  const spawnZ = saved ? saved.z : defaultSpawn.z;
+  console.log(`[GameSocket] Player "${username}" acct=${accountId} saved=${!!saved} savedPos=(${saved?.x}, ${saved?.z}) defaultSpawn=(${defaultSpawn.x}, ${defaultSpawn.z}) final=(${spawnX}, ${spawnZ})`);
 
   const player = new Player(username, spawnX, spawnZ, ws, accountId);
 

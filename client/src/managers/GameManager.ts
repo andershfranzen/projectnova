@@ -146,14 +146,20 @@ export class GameManager {
 
     this.engine = new Engine(canvas, true, { antialias: true });
     this.scene = new Scene(this.engine);
+    this.scene.useRightHandedSystem = true; // Match Three.js coordinate system (KC editor)
     this.scene.clearColor = new Color4(0.4, 0.6, 0.9, 1.0);
 
-    // Lighting
+    // Lighting — matched to KC editor's Three.js scene for correct terrain colors
     const ambient = new HemisphericLight('ambient', new Vector3(0, 1, 0), this.scene);
-    ambient.intensity = 0.5;
-    ambient.groundColor = new Color3(0.3, 0.3, 0.35);
+    ambient.intensity = 0.9;
+    ambient.diffuse = new Color3(0.54, 0.54, 0.54);
+    ambient.groundColor = new Color3(0.35, 0.33, 0.30);
     const sun = new DirectionalLight('sun', new Vector3(-0.5, -1, -0.3), this.scene);
-    sun.intensity = 0.8;
+    sun.intensity = 1.1;
+    sun.diffuse = new Color3(1.0, 0.84, 0.54);
+    const fill = new DirectionalLight('fill', new Vector3(0.3, -0.6, 0.5), this.scene);
+    fill.intensity = 0.65;
+    fill.diffuse = new Color3(0.67, 0.73, 0.80);
 
     // Camera
     this.camera = new GameCamera(this.scene, canvas);
@@ -1441,6 +1447,10 @@ export class GameManager {
   private handleGroundClick(worldX: number, worldZ: number): void {
     this.combatTargetId = -1;
 
+    const tx = Math.floor(worldX), tz = Math.floor(worldZ);
+    const blocked = this.isTileBlocked(tx, tz);
+    console.log(`[Click] target=(${worldX.toFixed(1)}, ${worldZ.toFixed(1)}) tile=(${tx},${tz}) blocked=${blocked}`);
+
     const path = findPath(this.playerX, this.playerZ, worldX, worldZ,
       this.isTileBlocked,
       this.chunkManager.getMapWidth(), this.chunkManager.getMapHeight(), 200,
@@ -1542,6 +1552,7 @@ export class GameManager {
 
     // Update chunks around player
     this.chunkManager.updatePlayerPosition(this.playerX, this.playerZ);
+    this.chunkManager.updateAnimations();
 
     // Combat follow
     if (this.combatTargetId >= 0 && this.localPlayer) {

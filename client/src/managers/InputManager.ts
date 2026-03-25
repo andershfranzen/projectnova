@@ -28,7 +28,7 @@ export class InputManager {
         const pickResult = this.scene.pick(
           this.scene.pointerX,
           this.scene.pointerY,
-          (mesh) => this.chunkManager.isGroundMesh(mesh.name)
+          (mesh) => this.chunkManager.isWalkableMesh(mesh.name)
         );
 
         if (pickResult?.hit && pickResult.pickedPoint) {

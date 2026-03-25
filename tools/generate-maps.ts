@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Generate heightmap.png, tilemap.png, meta.json, and spawns.json
+ * Generate map.json, meta.json, spawns.json, and walls.json
  * for the overworld (1024x1024) and underground (256x256) maps.
  *
  * Run: bun tools/generate-maps.ts
@@ -10,14 +10,13 @@
  * Underground has structured rooms and corridors.
  */
 
-import { PNG } from 'pngjs';
 import { writeFileSync, mkdirSync } from 'fs';
 import { resolve } from 'path';
 
 const OVERWORLD_SIZE = 1024;
 const UNDERGROUND_SIZE = 256;
 
-// Tile type constants (matching shared/types.ts TileType enum)
+// Tile type constants (used internally during generation)
 const GRASS = 0;
 const DIRT = 1;
 const STONE = 2;
@@ -26,22 +25,34 @@ const WALL = 4;
 const SAND = 5;
 const WOOD = 6;
 
+// Map old tile type constants to KC ground type strings
+const GROUND_TYPE: Record<number, string> = {
+  [GRASS]: 'grass',
+  [DIRT]:  'dirt',
+  [STONE]: 'road',
+  [WATER]: 'water',
+  [WALL]:  'grass',
+  [SAND]:  'sand',
+  [WOOD]:  'path',
+};
+
 // Wall edge bitmask constants (matching WallEdge in shared/types.ts)
 const WALL_N = 1;
 const WALL_E = 2;
 const WALL_S = 4;
 const WALL_W = 8;
 
-// Color palette matching TILEMAP_COLORS in shared/types.ts
-const COLORS: Record<number, [number, number, number]> = {
-  [GRASS]: [0x4a, 0x8a, 0x30],
-  [DIRT]:  [0x8c, 0x68, 0x40],
-  [STONE]: [0x80, 0x80, 0x80],
-  [WATER]: [0x30, 0x60, 0xb0],
-  [WALL]:  [0x50, 0x40, 0x40],
-  [SAND]:  [0xc0, 0xb0, 0x80],
-  [WOOD]:  [0x70, 0x50, 0x28],
-};
+// ---------- KC tile helper ----------
+
+function tile(ground: string, waterPainted = false) {
+  return {
+    ground, groundB: null, split: 'forward' as const,
+    textureId: null, textureRotation: 0, textureScale: 1,
+    textureWorldUV: false, textureHalfMode: false,
+    textureIdB: null, textureRotationB: 0, textureScaleB: 1,
+    waterPainted,
+  };
+}
 
 // ---------- helpers ----------
 
@@ -109,16 +120,27 @@ function distToRiver(x: number, z: number): number {
 const DUNGEON_ENTRANCE_X = 750;
 const DUNGEON_ENTRANCE_Z = 720;
 
-// ========== OVERWORLD HEIGHTMAP (1025x1025 vertices) ==========
+// Type for the KC map file format
+interface KCMapFile {
+  map: {
+    width: number;
+    height: number;
+    waterLevel: number;
+    chunkWaterLevels: Record<string, never>;
+    texturePlanes: never[];
+    tiles: ReturnType<typeof tile>[][];
+    heights: number[][];
+  };
+  placedObjects: never[];
+  layers: { id: string; name: string; visible: boolean }[];
+  activeLayerId: string;
+}
 
-function generateOverworldHeightmap(): Buffer {
+// ========== OVERWORLD HEIGHTS (1025x1025 vertices) ==========
+
+function generateOverworldHeights(): number[][] {
   const SIZE = OVERWORLD_SIZE;
   const V = SIZE + 1;
-  const png = new PNG({ width: V, height: V, colorType: 0 /* grayscale */ });
-
-  const MIN_H = -2.0;
-  const MAX_H = 10.0;
-  const RANGE = MAX_H - MIN_H;
 
   function baseNoise(x: number, z: number): number {
     const nx = x / SIZE;
@@ -236,26 +258,21 @@ function generateOverworldHeightmap(): Buffer {
     return h;
   }
 
+  const heights: number[][] = [];
   for (let vz = 0; vz < V; vz++) {
+    heights[vz] = [];
     for (let vx = 0; vx < V; vx++) {
-      const h = terrainHeight(vx, vz);
-      const normalized = Math.max(0, Math.min(255, Math.round(((h - MIN_H) / RANGE) * 255)));
-      const idx = (vz * V + vx) * 4; // pngjs always RGBA
-      png.data[idx] = normalized;
-      png.data[idx + 1] = normalized;
-      png.data[idx + 2] = normalized;
-      png.data[idx + 3] = 255;
+      heights[vz][vx] = terrainHeight(vx, vz);
     }
   }
 
-  return PNG.sync.write(png);
+  return heights;
 }
 
 // ========== OVERWORLD TILEMAP (1024x1024) ==========
 
-function generateOverworldTilemap(): { png: Buffer; walls: Record<string, number> } {
+function generateOverworldTiles(): { tiles: number[][]; walls: Record<string, number> } {
   const SIZE = OVERWORLD_SIZE;
-  const png = new PNG({ width: SIZE, height: SIZE, colorType: 2 /* RGB */ });
 
   // Initialize all to grass
   const tiles: number[][] = [];
@@ -622,54 +639,31 @@ function generateOverworldTilemap(): { png: Buffer; walls: Record<string, number
     tiles[i][SIZE - 1] = WALL;
   }
 
-  // Write pixels (pngjs always uses RGBA internally)
-  for (let z = 0; z < SIZE; z++) {
-    for (let x = 0; x < SIZE; x++) {
-      const tileType = tiles[x][z];
-      const [r, g, b] = COLORS[tileType] || COLORS[GRASS];
-      const idx = (z * SIZE + x) * 4;
-      png.data[idx] = r;
-      png.data[idx + 1] = g;
-      png.data[idx + 2] = b;
-      png.data[idx + 3] = 255;
-    }
-  }
-
-  return { png: PNG.sync.write(png), walls: wallEdges };
+  return { tiles, walls: wallEdges };
 }
 
-// ========== UNDERGROUND HEIGHTMAP (257x257 vertices) ==========
+// ========== UNDERGROUND HEIGHTS (257x257 vertices) ==========
 
-function generateUndergroundHeightmap(): Buffer {
+function generateUndergroundHeights(): number[][] {
   const SIZE = UNDERGROUND_SIZE;
   const V = SIZE + 1;
-  const png = new PNG({ width: V, height: V, colorType: 0 });
 
-  const MIN_H = -1.0;
-  const MAX_H = 3.0;
-  const RANGE = MAX_H - MIN_H;
-
+  const heights: number[][] = [];
   for (let vz = 0; vz < V; vz++) {
+    heights[vz] = [];
     for (let vx = 0; vx < V; vx++) {
       // Mostly flat with slight variation
-      const h = 0.3 + Math.sin(vx * 0.1) * Math.cos(vz * 0.1) * 0.2;
-      const normalized = Math.max(0, Math.min(255, Math.round(((h - MIN_H) / RANGE) * 255)));
-      const idx = (vz * V + vx) * 4; // pngjs always RGBA
-      png.data[idx] = normalized;
-      png.data[idx + 1] = normalized;
-      png.data[idx + 2] = normalized;
-      png.data[idx + 3] = 255;
+      heights[vz][vx] = 0.3 + Math.sin(vx * 0.1) * Math.cos(vz * 0.1) * 0.2;
     }
   }
 
-  return PNG.sync.write(png);
+  return heights;
 }
 
 // ========== UNDERGROUND TILEMAP (256x256) ==========
 
-function generateUndergroundTilemap(): { png: Buffer; walls: Record<string, number> } {
+function generateUndergroundTiles(): { tiles: number[][]; walls: Record<string, number> } {
   const SIZE = UNDERGROUND_SIZE;
-  const png = new PNG({ width: SIZE, height: SIZE, colorType: 2 });
 
   // Start everything as WALL (impassable darkness)
   const tiles: number[][] = [];
@@ -783,20 +777,46 @@ function generateUndergroundTilemap(): { png: Buffer; walls: Record<string, numb
     { side: 'n', pos: 13 },
   ]);
 
-  // Write pixels (FIXED: was *3, must be *4 — pngjs always uses RGBA)
-  for (let z = 0; z < SIZE; z++) {
-    for (let x = 0; x < SIZE; x++) {
+  return { tiles, walls: wallEdges };
+}
+
+// ========== Convert integer tile grid to KC tile grid ==========
+
+function convertTilesToKC(tiles: number[][], size: number): ReturnType<typeof tile>[][] {
+  const kcTiles: ReturnType<typeof tile>[][] = [];
+  for (let z = 0; z < size; z++) {
+    kcTiles[z] = [];
+    for (let x = 0; x < size; x++) {
       const tileType = tiles[x][z];
-      const [r, g, b] = COLORS[tileType] || COLORS[WALL];
-      const idx = (z * SIZE + x) * 4;
-      png.data[idx] = r;
-      png.data[idx + 1] = g;
-      png.data[idx + 2] = b;
-      png.data[idx + 3] = 255;
+      const ground = GROUND_TYPE[tileType] || 'grass';
+      const waterPainted = tileType === WATER;
+      kcTiles[z][x] = tile(ground, waterPainted);
     }
   }
+  return kcTiles;
+}
 
-  return { png: PNG.sync.write(png), walls: wallEdges };
+// ========== Build KC map file ==========
+
+function buildKCMapFile(
+  width: number, height: number, waterLevel: number,
+  kcTiles: ReturnType<typeof tile>[][],
+  heights: number[][],
+): KCMapFile {
+  return {
+    map: {
+      width,
+      height,
+      waterLevel,
+      chunkWaterLevels: {},
+      texturePlanes: [],
+      tiles: kcTiles,
+      heights,
+    },
+    placedObjects: [],
+    layers: [{ id: 'layer_0', name: 'Layer 1', visible: true }],
+    activeLayerId: 'layer_0',
+  };
 }
 
 // ========== WRITE EVERYTHING ==========
@@ -808,12 +828,17 @@ const BASE = resolve(import.meta.dir, '../server/data/maps');
   const dir = resolve(BASE, 'overworld');
   mkdirSync(dir, { recursive: true });
 
-  console.log('Generating overworld heightmap (1025x1025)...');
-  writeFileSync(resolve(dir, 'heightmap.png'), generateOverworldHeightmap());
+  console.log('Generating overworld heights (1025x1025)...');
+  const heights = generateOverworldHeights();
 
-  console.log('Generating overworld tilemap (1024x1024)...');
-  const overworldResult = generateOverworldTilemap();
-  writeFileSync(resolve(dir, 'tilemap.png'), overworldResult.png);
+  console.log('Generating overworld tiles (1024x1024)...');
+  const overworldResult = generateOverworldTiles();
+  const kcTiles = convertTilesToKC(overworldResult.tiles, OVERWORLD_SIZE);
+
+  console.log('Writing overworld map.json...');
+  const kcMap = buildKCMapFile(OVERWORLD_SIZE, OVERWORLD_SIZE, -0.3, kcTiles, heights);
+  writeFileSync(resolve(dir, 'map.json'), JSON.stringify(kcMap));
+
   writeFileSync(resolve(dir, 'walls.json'), JSON.stringify({ walls: overworldResult.walls }, null, 2));
   console.log(`  ${Object.keys(overworldResult.walls).length} wall edges written.`);
 
@@ -822,7 +847,6 @@ const BASE = resolve(import.meta.dir, '../server/data/maps');
     name: 'Overworld',
     width: OVERWORLD_SIZE,
     height: OVERWORLD_SIZE,
-    heightRange: [-2.0, 10.0],
     waterLevel: -0.3,
     spawnPoint: { x: 512.5, z: 512.5 },
     fogColor: [0.4, 0.6, 0.9],
@@ -963,12 +987,17 @@ const BASE = resolve(import.meta.dir, '../server/data/maps');
   const dir = resolve(BASE, 'underground');
   mkdirSync(dir, { recursive: true });
 
-  console.log('Generating underground heightmap (257x257)...');
-  writeFileSync(resolve(dir, 'heightmap.png'), generateUndergroundHeightmap());
+  console.log('Generating underground heights (257x257)...');
+  const heights = generateUndergroundHeights();
 
-  console.log('Generating underground tilemap (256x256)...');
-  const undergroundResult = generateUndergroundTilemap();
-  writeFileSync(resolve(dir, 'tilemap.png'), undergroundResult.png);
+  console.log('Generating underground tiles (256x256)...');
+  const undergroundResult = generateUndergroundTiles();
+  const kcTiles = convertTilesToKC(undergroundResult.tiles, UNDERGROUND_SIZE);
+
+  console.log('Writing underground map.json...');
+  const kcMap = buildKCMapFile(UNDERGROUND_SIZE, UNDERGROUND_SIZE, -0.5, kcTiles, heights);
+  writeFileSync(resolve(dir, 'map.json'), JSON.stringify(kcMap));
+
   writeFileSync(resolve(dir, 'walls.json'), JSON.stringify({ walls: undergroundResult.walls }, null, 2));
   console.log(`  ${Object.keys(undergroundResult.walls).length} wall edges written.`);
 
@@ -977,7 +1006,6 @@ const BASE = resolve(import.meta.dir, '../server/data/maps');
     name: 'Underground',
     width: UNDERGROUND_SIZE,
     height: UNDERGROUND_SIZE,
-    heightRange: [-1.0, 3.0],
     waterLevel: -0.5,
     spawnPoint: { x: 130.5, z: 130.5 }, // away from transition tile at (128,128)
     fogColor: [0.1, 0.08, 0.15],

@@ -24,8 +24,6 @@ export class PropertiesPanel {
     this.addField('Width', 'number', String(s.meta.width), () => {}, true);
     this.addField('Height', 'number', String(s.meta.height), () => {}, true);
     this.addField('Water Level', 'number', String(s.meta.waterLevel), (v) => { s.meta.waterLevel = parseFloat(v); s.dirty = true; });
-    this.addField('Min Height', 'number', String(s.meta.heightRange[0]), (v) => { s.meta.heightRange[0] = parseFloat(v); s.dirty = true; });
-    this.addField('Max Height', 'number', String(s.meta.heightRange[1]), (v) => { s.meta.heightRange[1] = parseFloat(v); s.dirty = true; });
 
     this.addSection('Spawn Point');
     this.addField('X', 'number', String(s.meta.spawnPoint.x), (v) => { s.meta.spawnPoint.x = parseFloat(v); s.dirty = true; });

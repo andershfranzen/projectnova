@@ -1,8 +1,8 @@
 import { SERVER_PORT, GAME_WS_PATH, CHAT_WS_PATH } from '@projectrs/shared';
 import { resolve } from 'path';
 import { statSync, readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'fs';
-import { PNG } from 'pngjs';
-import { TILEMAP_COLORS, type TileType } from '@projectrs/shared';
+import type { KCMapFile, KCMapData, KCTile, MapMeta, WallsFile, SpawnsFile } from '@projectrs/shared';
+import { defaultKCTile } from '@projectrs/shared';
 import { World } from './World';
 import { GameDatabase } from './Database';
 import {
@@ -31,6 +31,8 @@ const MIME_TYPES: Record<string, string> = {
   '.jpg': 'image/jpeg',
   '.svg': 'image/svg+xml',
   '.wasm': 'application/wasm',
+  '.glb': 'model/gltf-binary',
+  '.gltf': 'model/gltf+json',
 };
 
 function getMimeType(path: string): string {
@@ -108,6 +110,16 @@ const server = Bun.serve<SocketData>({
         return jsonResponse({ ok: false, error: result.error }, 400);
       } catch {
         return jsonResponse({ ok: false, error: 'Invalid request' }, 400);
+      }
+    }
+
+    if (url.pathname === '/api/validate' && req.method === 'POST') {
+      try {
+        const body = await req.json() as { token?: string };
+        const session = body.token ? db.getSession(body.token) : null;
+        return jsonResponse({ ok: !!session });
+      } catch {
+        return jsonResponse({ ok: false });
       }
     }
 
@@ -198,19 +210,13 @@ const server = Bun.serve<SocketData>({
       try {
         const body = await req.json() as {
           mapId: string;
-          meta: any;
-          spawns: any;
-          tilemap: number[];
-          heightmap: number[];
-          walls?: Record<string, number>;
-          wallHeights?: Record<string, number>;
-          floors?: Record<string, number>;
-          stairs?: Record<string, any>;
-          roofs?: Record<string, any>;
-          floorLayers?: Record<number, any>;
+          meta: MapMeta;
+          spawns: SpawnsFile;
+          mapData: KCMapFile;
+          walls?: WallsFile;
         };
-        const { mapId, meta, spawns, tilemap, heightmap, walls, wallHeights, floors, stairs, roofs, floorLayers } = body;
-        if (!mapId || !meta || !tilemap || !heightmap) {
+        const { mapId, meta, spawns, mapData, walls } = body;
+        if (!mapId || !meta || !mapData) {
           return jsonResponse({ ok: false, error: 'Missing fields' }, 400);
         }
         const mapDir = resolve(MAPS_DIR, mapId);
@@ -218,49 +224,11 @@ const server = Bun.serve<SocketData>({
           return new Response('Forbidden', { status: 403 });
         }
 
-        // Encode tilemap PNG
-        const tw = meta.width;
-        const th = meta.height;
-        const tilePng = new PNG({ width: tw, height: th, colorType: 2 });
-        for (let i = 0; i < tw * th; i++) {
-          const tileType = tilemap[i] as TileType;
-          const color = TILEMAP_COLORS[tileType] || TILEMAP_COLORS[0];
-          const idx = i * 4;
-          tilePng.data[idx] = color.r;
-          tilePng.data[idx + 1] = color.g;
-          tilePng.data[idx + 2] = color.b;
-          tilePng.data[idx + 3] = 255;
-        }
-        const tileBuffer = PNG.sync.write(tilePng);
-
-        // Encode heightmap PNG
-        const vw = tw + 1;
-        const vh = th + 1;
-        const heightPng = new PNG({ width: vw, height: vh, colorType: 0 });
-        for (let i = 0; i < vw * vh; i++) {
-          const val = Math.max(0, Math.min(255, heightmap[i]));
-          const idx = i * 4;
-          heightPng.data[idx] = val;
-          heightPng.data[idx + 1] = val;
-          heightPng.data[idx + 2] = val;
-          heightPng.data[idx + 3] = 255;
-        }
-        const heightBuffer = PNG.sync.write(heightPng);
-
         // Write all files
         writeFileSync(resolve(mapDir, 'meta.json'), JSON.stringify(meta, null, 2));
-        writeFileSync(resolve(mapDir, 'spawns.json'), JSON.stringify(spawns, null, 2));
-        writeFileSync(resolve(mapDir, 'tilemap.png'), tileBuffer);
-        writeFileSync(resolve(mapDir, 'heightmap.png'), heightBuffer);
-
-        // Write walls.json (sparse format with building data)
-        const wallsFile: any = { walls: walls || {} };
-        if (wallHeights && Object.keys(wallHeights).length > 0) wallsFile.wallHeights = wallHeights;
-        if (floors && Object.keys(floors).length > 0) wallsFile.floors = floors;
-        if (stairs && Object.keys(stairs).length > 0) wallsFile.stairs = stairs;
-        if (roofs && Object.keys(roofs).length > 0) wallsFile.roofs = roofs;
-        if (floorLayers && Object.keys(floorLayers).length > 0) wallsFile.floorLayers = floorLayers;
-        writeFileSync(resolve(mapDir, 'walls.json'), JSON.stringify(wallsFile, null, 2));
+        writeFileSync(resolve(mapDir, 'spawns.json'), JSON.stringify(spawns ?? { npcs: [], objects: [] }, null, 2));
+        writeFileSync(resolve(mapDir, 'map.json'), JSON.stringify(mapData, null, 2));
+        writeFileSync(resolve(mapDir, 'walls.json'), JSON.stringify(walls ?? { walls: {} }, null, 2));
 
         return jsonResponse({ ok: true });
       } catch (e: any) {
@@ -287,12 +255,11 @@ const server = Bun.serve<SocketData>({
         mkdirSync(mapDir, { recursive: true });
 
         // Default meta
-        const meta = {
+        const meta: MapMeta = {
           id: mapId,
           name,
           width,
           height,
-          heightRange: [-2, 10] as [number, number],
           waterLevel: -0.3,
           spawnPoint: { x: Math.floor(width / 2) + 0.5, z: Math.floor(height / 2) + 0.5 },
           fogColor: [0.4, 0.6, 0.9] as [number, number, number],
@@ -301,33 +268,43 @@ const server = Bun.serve<SocketData>({
           transitions: [],
         };
 
-        // All-grass tilemap
-        const tilePng = new PNG({ width, height, colorType: 2 });
-        const grass = TILEMAP_COLORS[0];
-        for (let i = 0; i < width * height; i++) {
-          const idx = i * 4;
-          tilePng.data[idx] = grass.r;
-          tilePng.data[idx + 1] = grass.g;
-          tilePng.data[idx + 2] = grass.b;
-          tilePng.data[idx + 3] = 255;
+        // Build default KC map data: all grass tiles, flat heights
+        const tiles: KCTile[][] = [];
+        for (let z = 0; z < height; z++) {
+          const row: KCTile[] = [];
+          for (let x = 0; x < width; x++) {
+            row.push(defaultKCTile('grass'));
+          }
+          tiles.push(row);
         }
 
-        // Flat heightmap (mid-range = 128)
-        const vw = width + 1;
-        const vh = height + 1;
-        const heightPng = new PNG({ width: vw, height: vh, colorType: 0 });
-        for (let i = 0; i < vw * vh; i++) {
-          const idx = i * 4;
-          heightPng.data[idx] = 128;
-          heightPng.data[idx + 1] = 128;
-          heightPng.data[idx + 2] = 128;
-          heightPng.data[idx + 3] = 255;
+        const heights: number[][] = [];
+        for (let z = 0; z <= height; z++) {
+          const row: number[] = [];
+          for (let x = 0; x <= width; x++) {
+            row.push(0);
+          }
+          heights.push(row);
         }
+
+        const mapData: KCMapFile = {
+          map: {
+            width,
+            height,
+            waterLevel: -0.3,
+            chunkWaterLevels: {},
+            texturePlanes: [],
+            tiles,
+            heights,
+          },
+          placedObjects: [],
+          layers: [{ id: 'default', name: 'Default', visible: true }],
+          activeLayerId: 'default',
+        };
 
         writeFileSync(resolve(mapDir, 'meta.json'), JSON.stringify(meta, null, 2));
         writeFileSync(resolve(mapDir, 'spawns.json'), JSON.stringify({ npcs: [], objects: [] }, null, 2));
-        writeFileSync(resolve(mapDir, 'tilemap.png'), PNG.sync.write(tilePng));
-        writeFileSync(resolve(mapDir, 'heightmap.png'), PNG.sync.write(heightPng));
+        writeFileSync(resolve(mapDir, 'map.json'), JSON.stringify(mapData, null, 2));
         writeFileSync(resolve(mapDir, 'walls.json'), JSON.stringify({ walls: {} }, null, 2));
 
         return jsonResponse({ ok: true, meta });
@@ -344,7 +321,7 @@ const server = Bun.serve<SocketData>({
         const mapDir = resolve(MAPS_DIR, mapId);
         if (!mapDir.startsWith(MAPS_DIR)) return new Response('Forbidden', { status: 403 });
 
-        // Reload the map in the world (re-read PNGs and JSON from disk)
+        // Reload the map in the world (re-read JSON from disk)
         try {
           world.reloadMap(mapId);
           return jsonResponse({ ok: true });
@@ -363,16 +340,10 @@ const server = Bun.serve<SocketData>({
       if (!mapDir.startsWith(MAPS_DIR)) return new Response('Forbidden', { status: 403 });
 
       try {
-        const files: Record<string, Uint8Array | string> = {};
-        for (const fname of ['meta.json', 'spawns.json', 'tilemap.png', 'heightmap.png']) {
-          files[fname] = readFileSync(resolve(mapDir, fname));
-        }
-        // Simple tar-like format: JSON with base64 blobs
         const exportFiles: Record<string, string> = {
           'meta.json': readFileSync(resolve(mapDir, 'meta.json'), 'utf-8'),
           'spawns.json': readFileSync(resolve(mapDir, 'spawns.json'), 'utf-8'),
-          'tilemap.png': Buffer.from(readFileSync(resolve(mapDir, 'tilemap.png'))).toString('base64'),
-          'heightmap.png': Buffer.from(readFileSync(resolve(mapDir, 'heightmap.png'))).toString('base64'),
+          'map.json': readFileSync(resolve(mapDir, 'map.json'), 'utf-8'),
         };
         const wallsPath = resolve(mapDir, 'walls.json');
         if (existsSync(wallsPath)) {
@@ -406,8 +377,7 @@ const server = Bun.serve<SocketData>({
 
         writeFileSync(resolve(mapDir, 'meta.json'), data.files['meta.json']);
         writeFileSync(resolve(mapDir, 'spawns.json'), data.files['spawns.json']);
-        writeFileSync(resolve(mapDir, 'tilemap.png'), Buffer.from(data.files['tilemap.png'], 'base64'));
-        writeFileSync(resolve(mapDir, 'heightmap.png'), Buffer.from(data.files['heightmap.png'], 'base64'));
+        writeFileSync(resolve(mapDir, 'map.json'), data.files['map.json']);
         if (data.files['walls.json']) {
           writeFileSync(resolve(mapDir, 'walls.json'), data.files['walls.json']);
         }
@@ -453,6 +423,27 @@ const server = Bun.serve<SocketData>({
       } catch {
         return new Response('Not Found', { status: 404 });
       }
+    }
+
+    // --- KC Editor Assets (GLB models, textures) ---
+
+    if (url.pathname.startsWith('/assets/')) {
+      const decodedPath = decodeURIComponent(url.pathname);
+      const publicAssetsDir = resolve(import.meta.dir, '../../client/public');
+      for (const baseDir of [CLIENT_DIST, publicAssetsDir]) {
+        const filePath = resolve(baseDir, decodedPath.slice(1));
+        if (!filePath.startsWith(baseDir)) continue;
+        try {
+          const content = readFileSync(filePath);
+          return new Response(content, {
+            headers: {
+              'Content-Type': getMimeType(filePath),
+              'Cache-Control': 'public, max-age=3600',
+            },
+          });
+        } catch { /* try next */ }
+      }
+      return new Response('Not Found', { status: 404 });
     }
 
     // --- Static File Serving ---

@@ -189,7 +189,6 @@ export interface MapMeta {
   name: string;
   width: number;
   height: number;
-  heightRange: [number, number];
   waterLevel: number;
   spawnPoint: { x: number; z: number };
   fogColor: [number, number, number];
@@ -215,30 +214,110 @@ export interface SpawnsFile {
   objects?: ObjectSpawnEntry[];
 }
 
-// Color-to-TileType mapping for tilemap PNG decoding
-export const TILEMAP_COLORS: { r: number; g: number; b: number; type: TileType }[] = [
-  { r: 0x4a, g: 0x8a, b: 0x30, type: TileType.GRASS },
-  { r: 0x8c, g: 0x68, b: 0x40, type: TileType.DIRT },
-  { r: 0x80, g: 0x80, b: 0x80, type: TileType.STONE },
-  { r: 0x30, g: 0x60, b: 0xb0, type: TileType.WATER },
-  { r: 0x50, g: 0x40, b: 0x40, type: TileType.WALL },
-  { r: 0xc0, g: 0xb0, b: 0x80, type: TileType.SAND },
-  { r: 0x70, g: 0x50, b: 0x28, type: TileType.WOOD },
-];
+// --- KC Map Editor format types ---
 
-/** Find closest TileType from RGB color */
-export function tileTypeFromRgb(r: number, g: number, b: number): TileType {
-  let best = TileType.GRASS;
-  let bestDist = Infinity;
-  for (const entry of TILEMAP_COLORS) {
-    const dr = r - entry.r;
-    const dg = g - entry.g;
-    const db = b - entry.b;
-    const dist = dr * dr + dg * dg + db * db;
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = entry.type;
-    }
+export type GroundType = 'grass' | 'dirt' | 'sand' | 'path' | 'road' | 'water';
+export type SplitDirection = 'forward' | 'back';
+
+export interface KCTile {
+  ground: GroundType;
+  groundB: GroundType | null;
+  split: SplitDirection;
+  textureId: string | null;
+  textureRotation: number;
+  textureScale: number;
+  textureWorldUV: boolean;
+  textureHalfMode: boolean;
+  textureIdB: string | null;
+  textureRotationB: number;
+  textureScaleB: number;
+  waterPainted: boolean;
+}
+
+export interface TexturePlane {
+  id: string;
+  textureId: string;
+  width: number;
+  height: number;
+  vertical: boolean;
+  doubleSided: boolean;
+  position: { x: number; y: number; z: number };
+  rotation: { x: number; y: number; z: number };
+  scale: { x: number; y: number; z: number };
+  uvRepeat: number;
+}
+
+export interface PlacedObject {
+  assetId: string;
+  layerId: string;
+  position: { x: number; y: number; z: number };
+  rotation: { x: number; y: number; z: number };
+  scale: { x: number; y: number; z: number };
+}
+
+export interface EditorLayer {
+  id: string;
+  name: string;
+  visible: boolean;
+}
+
+/** The KC map data stored in map.json */
+export interface KCMapData {
+  width: number;
+  height: number;
+  waterLevel: number;
+  chunkWaterLevels: Record<string, number>;
+  texturePlanes: TexturePlane[];
+  tiles: KCTile[][];       // [z][x]
+  heights: number[][];     // [z][x] vertex heights, (height+1) x (width+1)
+}
+
+/** Full map.json file format (KC editor save) */
+export interface KCMapFile {
+  map: KCMapData;
+  placedObjects: PlacedObject[];
+  layers: EditorLayer[];
+  activeLayerId: string;
+}
+
+/** Default KC tile */
+export function defaultKCTile(ground: GroundType = 'grass'): KCTile {
+  return {
+    ground,
+    groundB: null,
+    split: 'forward',
+    textureId: null,
+    textureRotation: 0,
+    textureScale: 1,
+    textureWorldUV: false,
+    textureHalfMode: false,
+    textureIdB: null,
+    textureRotationB: 0,
+    textureScaleB: 1,
+    waterPainted: false,
+  };
+}
+
+/** Map KC ground type to game TileType (for collision/pathfinding) */
+export function groundTypeToTileType(ground: GroundType): TileType {
+  switch (ground) {
+    case 'grass': return TileType.GRASS;
+    case 'dirt':  return TileType.DIRT;
+    case 'sand':  return TileType.SAND;
+    case 'path':  return TileType.DIRT;
+    case 'road':  return TileType.STONE;
+    case 'water': return TileType.WATER;
+    default:      return TileType.GRASS;
   }
-  return best;
+}
+
+/** Check if a KC tile should render water (height-based or painted) */
+export function shouldTileRenderWater(
+  tile: KCTile,
+  cornerHeights: { tl: number; tr: number; bl: number; br: number },
+  waterLevel: number,
+): boolean {
+  if (tile.waterPainted) return true;
+  const minH = Math.min(cornerHeights.tl, cornerHeights.tr, cornerHeights.bl, cornerHeights.br);
+  return minH <= waterLevel;
 }

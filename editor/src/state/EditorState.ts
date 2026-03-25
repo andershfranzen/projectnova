@@ -95,7 +95,7 @@ export function createInitialState(): EditorState {
     mapId: '',
     meta: {
       id: '', name: '', width: 0, height: 0,
-      heightRange: [-2, 10], waterLevel: -0.3,
+      waterLevel: -0.3,
       spawnPoint: { x: 0, z: 0 },
       fogColor: [0.4, 0.6, 0.9], fogStart: 30, fogEnd: 50,
       transitions: [],

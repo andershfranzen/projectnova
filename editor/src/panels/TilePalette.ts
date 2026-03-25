@@ -1,15 +1,15 @@
-import { TileType, TILEMAP_COLORS } from '@projectrs/shared';
+import { TileType } from '@projectrs/shared';
 import type { StateManager } from '../state/EditorState';
 
-const TILE_NAMES: Record<number, string> = {
-  [TileType.GRASS]: 'Grass',
-  [TileType.DIRT]: 'Dirt',
-  [TileType.STONE]: 'Stone',
-  [TileType.WATER]: 'Water',
-  [TileType.WALL]: 'Wall',
-  [TileType.SAND]: 'Sand',
-  [TileType.WOOD]: 'Wood',
-};
+const TILE_ENTRIES: { type: TileType; name: string; r: number; g: number; b: number }[] = [
+  { type: TileType.GRASS, name: 'Grass', r: 0x4a, g: 0x8a, b: 0x30 },
+  { type: TileType.DIRT, name: 'Dirt', r: 0x8c, g: 0x68, b: 0x40 },
+  { type: TileType.STONE, name: 'Stone', r: 0x80, g: 0x80, b: 0x80 },
+  { type: TileType.WATER, name: 'Water', r: 0x30, g: 0x60, b: 0xb0 },
+  { type: TileType.WALL, name: 'Wall', r: 0x50, g: 0x40, b: 0x40 },
+  { type: TileType.SAND, name: 'Sand', r: 0xc0, g: 0xb0, b: 0x80 },
+  { type: TileType.WOOD, name: 'Wood', r: 0x70, g: 0x50, b: 0x28 },
+];
 
 export class TilePalette {
   private container: HTMLElement;
@@ -27,7 +27,7 @@ export class TilePalette {
     header.textContent = 'Tile Palette';
     this.container.appendChild(header);
 
-    for (const entry of TILEMAP_COLORS) {
+    for (const entry of TILE_ENTRIES) {
       const item = document.createElement('div');
       item.className = 'palette-item';
       if (entry.type === this.stateMgr.state.selectedTileType) {
@@ -40,7 +40,7 @@ export class TilePalette {
 
       const label = document.createElement('span');
       label.className = 'palette-label';
-      label.textContent = TILE_NAMES[entry.type] || `Type ${entry.type}`;
+      label.textContent = entry.name;
 
       item.appendChild(swatch);
       item.appendChild(label);
@@ -55,8 +55,8 @@ export class TilePalette {
   }
 
   updateSelection(): void {
-    for (let i = 0; i < TILEMAP_COLORS.length; i++) {
-      this.items[i].classList.toggle('selected', TILEMAP_COLORS[i].type === this.stateMgr.state.selectedTileType);
+    for (let i = 0; i < TILE_ENTRIES.length; i++) {
+      this.items[i].classList.toggle('selected', TILE_ENTRIES[i].type === this.stateMgr.state.selectedTileType);
     }
   }
 }

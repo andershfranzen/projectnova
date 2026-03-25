@@ -3,10 +3,6 @@
   "name": "Underground",
   "width": 256,
   "height": 256,
-  "heightRange": [
-    -1,
-    3
-  ],
   "waterLevel": -0.5,
   "spawnPoint": {
     "x": 130.5,

@@ -52,8 +52,8 @@ export interface EditorMapData {
 
 /** Convert editor state's Uint8Array heights (0-255 pixels) to Float32Array world heights */
 export function convertEditorState(state: EditorState): EditorMapData {
-  const [minH, maxH] = state.meta.heightRange;
-  const range = maxH - minH;
+  const minH = -2;
+  const range = 12; // default range: -2 to 10
   const vw = state.meta.width + 1;
   const vh = state.meta.height + 1;
   const heights = new Float32Array(vw * vh);

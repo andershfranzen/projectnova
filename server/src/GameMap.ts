@@ -1,13 +1,12 @@
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
-import { PNG } from 'pngjs';
-import { CHUNK_SIZE, TileType, BLOCKING_TILES, tileTypeFromRgb, WallEdge, DEFAULT_WALL_HEIGHT } from '@projectrs/shared';
-import type { MapMeta, MapTransition, WallsFile, StairData, RoofData, FloorLayerData } from '@projectrs/shared';
+import { CHUNK_SIZE, TileType, BLOCKING_TILES, groundTypeToTileType, shouldTileRenderWater, WallEdge, DEFAULT_WALL_HEIGHT } from '@projectrs/shared';
+import type { MapMeta, MapTransition, WallsFile, StairData, RoofData, FloorLayerData, KCMapFile, KCMapData, KCTile, GroundType } from '@projectrs/shared';
 
 const MAPS_DIR = resolve(import.meta.dir, '../data/maps');
 
 /**
- * Server-side map — loads terrain from heightmap + tilemap PNG files.
+ * Server-side map — loads terrain from KC editor JSON format (map.json).
  */
 export class GameMap {
   readonly id: string;
@@ -15,10 +14,15 @@ export class GameMap {
   readonly width: number;
   readonly height: number;
 
-  /** Height values at vertices (width+1 x height+1) */
-  private heights: Float32Array;
-  /** Tile types (width x height) */
-  private tiles: Uint8Array;
+  /** KC map data (tiles, heights, water levels) */
+  private mapData: KCMapData;
+
+  /** Cached tile types for fast collision checks */
+  private tileTypes: Uint8Array;
+
+  /** Height values at vertices (width+1 x height+1) — flat cache from mapData.heights */
+  private heightCache: Float32Array;
+
   /** Wall edge bitmasks per tile (width x height) */
   private walls: Uint8Array;
   /** Per-tile wall height overrides (sparse — only stores non-default) */
@@ -40,9 +44,6 @@ export class GameMap {
     roofs: Map<number, RoofData>;
   }> = new Map();
 
-  private minH: number;
-  private maxH: number;
-
   constructor(mapId: string) {
     this.id = mapId;
     const dir = resolve(MAPS_DIR, mapId);
@@ -51,37 +52,48 @@ export class GameMap {
     this.meta = JSON.parse(readFileSync(resolve(dir, 'meta.json'), 'utf-8')) as MapMeta;
     this.width = this.meta.width;
     this.height = this.meta.height;
-    this.minH = this.meta.heightRange[0];
-    this.maxH = this.meta.heightRange[1];
-    const range = this.maxH - this.minH;
 
-    // Load heightmap
-    const heightPng = PNG.sync.read(readFileSync(resolve(dir, 'heightmap.png')));
+    // Load KC map data
+    const mapFile: KCMapFile = JSON.parse(readFileSync(resolve(dir, 'map.json'), 'utf-8'));
+    this.mapData = mapFile.map;
+
+    // Build height cache (flat Float32Array for fast access)
     const vw = this.width + 1;
     const vh = this.height + 1;
-    if (heightPng.width !== vw || heightPng.height !== vh) {
-      throw new Error(`Heightmap for '${mapId}' must be ${vw}x${vh}, got ${heightPng.width}x${heightPng.height}`);
+    this.heightCache = new Float32Array(vw * vh);
+    for (let z = 0; z <= this.height; z++) {
+      for (let x = 0; x <= this.width; x++) {
+        this.heightCache[z * vw + x] = this.mapData.heights[z]?.[x] ?? 0;
+      }
     }
 
-    this.heights = new Float32Array(vw * vh);
-    for (let i = 0; i < vw * vh; i++) {
-      // pngjs stores RGBA even for grayscale, pixel value is in R channel
-      const pixel = heightPng.data[i * 4];
-      this.heights[i] = (pixel / 255) * range + this.minH;
-    }
+    // Build tile type cache for collision
+    this.tileTypes = new Uint8Array(this.width * this.height);
+    for (let z = 0; z < this.height; z++) {
+      for (let x = 0; x < this.width; x++) {
+        const tile = this.mapData.tiles[z]?.[x];
+        if (!tile) {
+          this.tileTypes[z * this.width + x] = TileType.GRASS;
+          continue;
+        }
+        // Check if this tile is effectively water (painted or below water level)
+        const corners = {
+          tl: this.mapData.heights[z]?.[x] ?? 0,
+          tr: this.mapData.heights[z]?.[x + 1] ?? 0,
+          bl: this.mapData.heights[z + 1]?.[x] ?? 0,
+          br: this.mapData.heights[z + 1]?.[x + 1] ?? 0,
+        };
+        const chunkX = Math.floor(x / 64);
+        const chunkZ = Math.floor(z / 64);
+        const chunkKey = `${chunkX},${chunkZ}`;
+        const waterLevel = this.mapData.chunkWaterLevels[chunkKey] ?? this.mapData.waterLevel;
 
-    // Load tilemap
-    const tilePng = PNG.sync.read(readFileSync(resolve(dir, 'tilemap.png')));
-    if (tilePng.width !== this.width || tilePng.height !== this.height) {
-      throw new Error(`Tilemap for '${mapId}' must be ${this.width}x${this.height}, got ${tilePng.width}x${tilePng.height}`);
-    }
-
-    this.tiles = new Uint8Array(this.width * this.height);
-    for (let i = 0; i < this.width * this.height; i++) {
-      const r = tilePng.data[i * 4];
-      const g = tilePng.data[i * 4 + 1];
-      const b = tilePng.data[i * 4 + 2];
-      this.tiles[i] = tileTypeFromRgb(r, g, b);
+        if (shouldTileRenderWater(tile, corners, waterLevel)) {
+          this.tileTypes[z * this.width + x] = TileType.WATER;
+        } else {
+          this.tileTypes[z * this.width + x] = groundTypeToTileType(tile.ground);
+        }
+      }
     }
 
     // Load walls and building data
@@ -147,7 +159,72 @@ export class GameMap {
       }
     }
 
-    console.log(`Loaded map '${mapId}': ${this.width}x${this.height} tiles, height range [${this.minH}, ${this.maxH}], ${this.floorLayers.size} upper floors`);
+    // Register horizontal texture planes as walkable floors (bridges, platforms)
+    this.registerTexturePlaneFloors(mapFile);
+
+    console.log(`Loaded map '${mapId}': ${this.width}x${this.height} tiles, waterLevel=${this.mapData.waterLevel}, ${this.floorLayers.size} upper floors`);
+  }
+
+  /** Detect horizontal texture planes and register them as walkable bridges/floors.
+   *  A flat plane acts as a walkable floor when it sits significantly above the terrain
+   *  beneath it (bridges over water, valleys, or any gap). */
+  private registerTexturePlaneFloors(mapFile: KCMapFile): void {
+    const planes = this.mapData.texturePlanes || [];
+    let count = 0;
+    for (const plane of planes) {
+      // Detect physically flat planes: rotation.x ≈ -PI/2
+      const rx = plane.rotation?.x ?? 0;
+      const isFlat = Math.abs(Math.abs(rx) - Math.PI / 2) < 0.1;
+      if (!isFlat) continue;
+
+      const px = plane.position?.x ?? 0;
+      const py = plane.position?.y ?? 0;
+      const pz = plane.position?.z ?? 0;
+      const sx = plane.scale?.x ?? 1;
+      const sy = plane.scale?.y ?? 1;
+      const ry = plane.rotation?.y ?? 0;
+
+      const hw = (plane.width ?? 1) * sx / 2;
+      const hd = (plane.height ?? 1) * sy / 2;
+      const cosR = Math.cos(ry), sinR = Math.sin(ry);
+      const corners = [
+        { x: px + (-hw) * cosR - (-hd) * sinR, z: pz + (-hw) * sinR + (-hd) * cosR },
+        { x: px + (hw) * cosR - (-hd) * sinR, z: pz + (hw) * sinR + (-hd) * cosR },
+        { x: px + (hw) * cosR - (hd) * sinR, z: pz + (hw) * sinR + (hd) * cosR },
+        { x: px + (-hw) * cosR - (hd) * sinR, z: pz + (-hw) * sinR + (hd) * cosR },
+      ];
+
+      let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+      for (const c of corners) {
+        if (c.x < minX) minX = c.x; if (c.x > maxX) maxX = c.x;
+        if (c.z < minZ) minZ = c.z; if (c.z > maxZ) maxZ = c.z;
+      }
+
+      const tx0 = Math.max(0, Math.floor(minX));
+      const tx1 = Math.min(this.width - 1, Math.floor(maxX));
+      const tz0 = Math.max(0, Math.floor(minZ));
+      const tz1 = Math.min(this.height - 1, Math.floor(maxZ));
+
+      for (let tz = tz0; tz <= tz1; tz++) {
+        for (let tx = tx0; tx <= tx1; tx++) {
+          const idx = tz * this.width + tx;
+          // Only affect tiles that are currently blocked (water, wall)
+          // Non-blocked tiles keep their terrain height — no floating
+          if (!BLOCKING_TILES.has(this.tileTypes[idx] as TileType)) continue;
+
+          this.tileTypes[idx] = TileType.STONE; // make walkable
+          // Use the lowest flat plane as walking surface
+          const existing = this.floorHeights.get(idx);
+          if (existing === undefined || py < existing) {
+            this.floorHeights.set(idx, py);
+          }
+          count++;
+        }
+      }
+    }
+    if (count > 0) {
+      console.log(`  Registered ${count} tiles as walkable from texture plane bridges`);
+    }
   }
 
   /** Get floor layer data (null = ground floor) */
@@ -169,8 +246,7 @@ export class GameMap {
   isTileBlockedOnFloor(x: number, z: number, floor: number): boolean {
     if (floor === 0) return this.isBlocked(x, z);
     const layer = this.floorLayers.get(floor);
-    if (!layer) return true; // no floor layer = can't walk
-    // Must have a floor or tiles defined
+    if (!layer) return true;
     const idx = z * this.width + x;
     const hasTile = layer.tiles.has(idx);
     const hasFloor = layer.floors.has(idx);
@@ -226,7 +302,7 @@ export class GameMap {
   getVertexHeight(vx: number, vz: number): number {
     const vw = this.width + 1;
     if (vx < 0 || vx >= vw || vz < 0 || vz >= this.height + 1) return 0;
-    return this.heights[vz * vw + vx];
+    return this.heightCache[vz * vw + vx];
   }
 
   /** Bilinear interpolation of height at fractional world coordinates */
@@ -254,14 +330,14 @@ export class GameMap {
     const tx = Math.floor(x);
     const tz = Math.floor(z);
     if (tx < 0 || tx >= this.width || tz < 0 || tz >= this.height) return true;
-    return BLOCKING_TILES.has(this.tiles[tz * this.width + tx] as TileType);
+    return BLOCKING_TILES.has(this.tileTypes[tz * this.width + tx] as TileType);
   }
 
   getTileType(x: number, z: number): TileType {
     const tx = Math.floor(x);
     const tz = Math.floor(z);
     if (tx < 0 || tx >= this.width || tz < 0 || tz >= this.height) return TileType.WALL;
-    return this.tiles[tz * this.width + tx] as TileType;
+    return this.tileTypes[tz * this.width + tx] as TileType;
   }
 
   getWall(x: number, z: number): number {
@@ -305,7 +381,6 @@ export class GameMap {
     const tx = Math.floor(x);
     const tz = Math.floor(z);
 
-    // Check for stair on this floor
     const stair = this.getStairOnFloor(tx, tz, floor);
     if (stair) {
       const fx = x - tx;
@@ -321,14 +396,11 @@ export class GameMap {
     }
 
     if (floor === 0) {
-      // Check for elevated floor
       const floorH = this.getFloorHeight(x, z);
       if (floorH !== null) return floorH;
-      // Default: terrain height
       return this.getInterpolatedHeight(x, z);
     }
 
-    // Upper floor: check floors map
     const layer = this.floorLayers.get(floor);
     if (layer) {
       const idx = tz * this.width + tx;
@@ -336,7 +408,6 @@ export class GameMap {
       if (floorH !== undefined) return floorH;
     }
 
-    // No floor data on this level — fallback to terrain (shouldn't normally happen)
     return this.getInterpolatedHeight(x, z);
   }
 
@@ -350,26 +421,24 @@ export class GameMap {
     const dx = tx - fx;
     const dz = tz - fz;
 
-    // Cardinal movement
     if (dx === 0 && dz === -1) return (this.getWall(fx, fz) & WallEdge.N) !== 0;
     if (dx === 1 && dz === 0) return (this.getWall(fx, fz) & WallEdge.E) !== 0;
     if (dx === 0 && dz === 1) return (this.getWall(fx, fz) & WallEdge.S) !== 0;
     if (dx === -1 && dz === 0) return (this.getWall(fx, fz) & WallEdge.W) !== 0;
 
-    // Diagonal movement — blocked if either of the two edges that would be crossed has a wall
-    if (dx === 1 && dz === -1) {  // NE
+    if (dx === 1 && dz === -1) {
       return (this.getWall(fx, fz) & WallEdge.N) !== 0 || (this.getWall(fx, fz) & WallEdge.E) !== 0
           || (this.getWall(tx, tz) & WallEdge.S) !== 0 || (this.getWall(tx, tz) & WallEdge.W) !== 0;
     }
-    if (dx === -1 && dz === -1) { // NW
+    if (dx === -1 && dz === -1) {
       return (this.getWall(fx, fz) & WallEdge.N) !== 0 || (this.getWall(fx, fz) & WallEdge.W) !== 0
           || (this.getWall(tx, tz) & WallEdge.S) !== 0 || (this.getWall(tx, tz) & WallEdge.E) !== 0;
     }
-    if (dx === 1 && dz === 1) {   // SE
+    if (dx === 1 && dz === 1) {
       return (this.getWall(fx, fz) & WallEdge.S) !== 0 || (this.getWall(fx, fz) & WallEdge.E) !== 0
           || (this.getWall(tx, tz) & WallEdge.N) !== 0 || (this.getWall(tx, tz) & WallEdge.W) !== 0;
     }
-    if (dx === -1 && dz === 1) {  // SW
+    if (dx === -1 && dz === 1) {
       return (this.getWall(fx, fz) & WallEdge.S) !== 0 || (this.getWall(fx, fz) & WallEdge.W) !== 0
           || (this.getWall(tx, tz) & WallEdge.N) !== 0 || (this.getWall(tx, tz) & WallEdge.E) !== 0;
     }
@@ -379,7 +448,6 @@ export class GameMap {
 
   findSpawnPoint(): { x: number; z: number } {
     const sp = this.meta.spawnPoint;
-    // Verify spawn point isn't blocked, search nearby if it is
     if (!this.isBlocked(sp.x, sp.z)) {
       return { x: sp.x, z: sp.z };
     }
@@ -401,7 +469,6 @@ export class GameMap {
     return this.meta.transitions;
   }
 
-  /** Check if a position is on a transition tile. Returns the transition or null. */
   getTransitionAt(x: number, z: number): MapTransition | null {
     const tx = Math.floor(x);
     const tz = Math.floor(z);
@@ -424,7 +491,6 @@ export class GameMap {
     const h = this.height;
     const maxSteps = 800;
 
-    // Binary min-heap
     interface PNode { x: number; z: number; g: number; hv: number; f: number; parent: PNode | null; heapIdx: number }
     const heap: PNode[] = [];
     const openMap = new Map<number, PNode>();
@@ -497,7 +563,6 @@ export class GameMap {
       closed.add(ck);
 
       const dirs: [number, number][] = [[-1, 0], [1, 0], [0, -1], [0, 1]];
-      // Diagonal: allowed only if both cardinal neighbors are passable AND no wall edges block
       const canW = !this.isBlocked(current.x - 1, current.z) && !this.isWallBlocked(current.x, current.z, current.x - 1, current.z);
       const canE = !this.isBlocked(current.x + 1, current.z) && !this.isWallBlocked(current.x, current.z, current.x + 1, current.z);
       const canN = !this.isBlocked(current.x, current.z - 1) && !this.isWallBlocked(current.x, current.z, current.x, current.z - 1);
@@ -539,7 +604,6 @@ export class GameMap {
     return [];
   }
 
-  /** Find path on a specific floor. Floor 0 uses ground terrain, floors 1+ use floor layer data. */
   findPathOnFloor(startX: number, startZ: number, goalX: number, goalZ: number, floor: number): { x: number; z: number }[] {
     if (floor === 0) return this.findPath(startX, startZ, goalX, goalZ);
 
