@@ -1,8 +1,23 @@
-import * as THREE from 'three'
+import { Engine } from '@babylonjs/core/Engines/engine'
+import { Scene } from '@babylonjs/core/scene'
+import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera'
+import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight'
+import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight'
+import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
+import { Mesh } from '@babylonjs/core/Meshes/mesh'
+import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder'
+import { TransformNode } from '@babylonjs/core/Meshes/transformNode'
+import { Vector3, Matrix, Quaternion } from '@babylonjs/core/Maths/math.vector'
+import { Color3, Color4 } from '@babylonjs/core/Maths/math.color'
+import { Texture } from '@babylonjs/core/Materials/Textures/texture'
+import { ImageProcessingConfiguration } from '@babylonjs/core/Materials/imageProcessingConfiguration'
+import '@babylonjs/core/Culling/ray'
+import '@babylonjs/loaders/glTF'
+
 import { MapData } from './map/MapData.js'
 import { ToolMode, toolLabel } from './editor/Tools.js'
 import { loadAssetRegistry } from './assets-system/AssetRegistry.js'
-import { loadAssetModel, makeGhostMaterial, getAssetAnimations } from './assets-system/AssetLoader.js'
+import { loadAssetModel, makeGhostMaterial, initAssetLoader } from './assets-system/AssetLoader.js'
 import { loadTextureRegistry } from './assets-system/TextureRegistry.js'
 import {
   buildTerrainMeshes,
@@ -14,28 +29,47 @@ import {
 } from './map/TerrainMesh.js'
 
 export function createEditorScene(container) {
-  const scene = new THREE.Scene()
+  // --- Babylon.js engine & scene setup ---
+  const canvas = document.createElement('canvas')
+  canvas.style.position = 'absolute'
+  canvas.style.inset = '0'
+  canvas.style.width = '100%'
+  canvas.style.height = '100%'
+  canvas.style.zIndex = '0'
+  container.appendChild(canvas)
 
-scene.background = new THREE.Color(0x0a1205)
-scene.fog = new THREE.Fog(0x0a1205, 22, 72)
+  const engine = new Engine(canvas, true, { antialias: true })
+  const scene = new Scene(engine)
+  scene.useRightHandedSystem = true
 
-const sun = new THREE.DirectionalLight(0xffd78a, 1.1)
-sun.position.set(16, 30, 16)
-sun.layers.set(0)
-scene.add(sun)
+  // Prevent Babylon from consuming pointer events — we handle input manually
+  scene.preventDefaultOnPointerDown = false
+  scene.preventDefaultOnPointerUp = false
 
-const fillLight = new THREE.DirectionalLight(0xaabbcc, 0.65)
-fillLight.position.set(-10, 6, 10)
-fillLight.layers.set(0)
-scene.add(fillLight)
+  scene.clearColor = new Color4(0.039, 0.071, 0.020, 1.0) // 0x0a1205
+  scene.fogMode = Scene.FOGMODE_LINEAR
+  scene.fogColor = new Color3(0.039, 0.071, 0.020)
+  scene.fogStart = 22
+  scene.fogEnd = 72
 
-const ambientMain = new THREE.AmbientLight(0x8a8a8a, 0.62)
-scene.add(ambientMain)
+  // Disable image processing — vertex colors are pre-baked with shading
+  scene.imageProcessingConfiguration.isEnabled = false
 
-const ambientGreen = new THREE.AmbientLight(0x5c6448, 0.08)
-scene.add(ambientGreen)
-const hemiLight = new THREE.HemisphereLight(0x181818, 0x2f2410, 0.18)
-scene.add(hemiLight)
+  // Single bright hemispheric light — vertex colors contain all shading already.
+  // HemisphericLight with intensity 2.0 and white diffuse ensures vertex colors
+  // render at approximately their raw values through StandardMaterial's diffuse path.
+  const ambient = new HemisphericLight('ambient', new Vector3(0, 1, 0), scene)
+  ambient.intensity = 2.0
+  ambient.diffuse = new Color3(1.0, 1.0, 1.0)
+  ambient.groundColor = new Color3(0.85, 0.85, 0.85)
+  ambient.specular = new Color3(0, 0, 0)
+
+  // Keep references for dungeon mode switching
+  const sun = ambient   // alias for applyMapType compatibility
+  const fill = ambient  // alias for applyMapType compatibility
+
+  // Initialize asset loader with scene reference
+  initAssetLoader(scene)
 
 function tuneModelLighting(model, assetPath = '') {
   const pathLower = assetPath.toLowerCase()
@@ -44,122 +78,79 @@ function tuneModelLighting(model, assetPath = '') {
   const isWhiteModular = pathLower.includes('white')
   const isRock = pathLower.includes('rock')
 
-  // ── Brightness scalar for "white" named modular assets ──────────────────
-  // White pieces are MeshBasicMaterial (unlit) so their colour renders at
-  // full intensity. Lower this value to dim them; raise it to brighten.
   const WHITE_MODULAR_BRIGHTNESS = 0.55
-  // ────────────────────────────────────────────────────────────────────────
 
-  model.traverse((child) => {
-    if (!child.isMesh || !child.material) return
+  let brightness = 1.0
+  if (isWhiteModular) brightness = WHITE_MODULAR_BRIGHTNESS
+  else if (isWoodModular) brightness = 0.34
+  else if (isModular) brightness = 1.0
+  else if (isRock) brightness = 0.60
 
-    const materials = Array.isArray(child.material) ? child.material : [child.material]
+  const meshes = model.getChildMeshes ? model.getChildMeshes() : []
+  for (const child of meshes) {
+    const mat = child.material
+    if (!mat) continue
 
-    const tuned = materials.map((src) => {
-      if (src.map) src.map.colorSpace = THREE.SRGBColorSpace
+    // Convert to unlit: move color to emissive, zero out diffuse
+    const hasDiffuseTex = !!mat.diffuseTexture
+    if (hasDiffuseTex) {
+      mat.emissiveTexture = mat.diffuseTexture
+      mat.diffuseTexture = null
+      mat.emissiveColor = new Color3(brightness, brightness, brightness)
+    } else {
+      const dc = mat.diffuseColor || new Color3(1, 1, 1)
+      mat.emissiveColor = new Color3(dc.r * brightness, dc.g * brightness, dc.b * brightness)
+    }
 
-      const alphaTest = src.alphaTest ?? 0
-      const isAlphaCutout = alphaTest > 0
-
-      let mat
-
-      if (isWhiteModular) {
-        // Flat unlit — dimmed so white pieces don't blow out in the editor
-        mat = new THREE.MeshBasicMaterial({
-          map: src.map || null,
-          color: src.color ? src.color.clone().multiplyScalar(WHITE_MODULAR_BRIGHTNESS) : new THREE.Color(WHITE_MODULAR_BRIGHTNESS, WHITE_MODULAR_BRIGHTNESS, WHITE_MODULAR_BRIGHTNESS),
-          alphaMap: src.alphaMap || null,
-          alphaTest,
-          side: THREE.DoubleSide,
-          transparent: isAlphaCutout ? false : !!src.transparent,
-          depthWrite: true
-        })
-      } else if (isWoodModular) {
-        // Flat unlit — same as other modular, no lighting/shadows
-        mat = new THREE.MeshBasicMaterial({
-          map: src.map || null,
-          color: src.color ? src.color.clone().multiplyScalar(0.34) : new THREE.Color(0.34, 0.34, 0.34),
-          alphaMap: src.alphaMap || null,
-          alphaTest,
-          side: THREE.DoubleSide,
-          transparent: isAlphaCutout ? false : !!src.transparent,
-          depthWrite: true
-        })
-      } else if (isModular) {
-        // Flat unlit — consistent face colours, good for RS Classic architecture
-        mat = new THREE.MeshBasicMaterial({
-          map: src.map || null,
-          color: src.color ? src.color.clone() : 0xffffff,
-          alphaMap: src.alphaMap || null,
-          alphaTest,
-          side: THREE.DoubleSide,
-          transparent: isAlphaCutout ? false : !!src.transparent,
-          depthWrite: true
-        })
-      } else {
-        const brightness = isRock ? 0.60 : 1.0
-        mat = new THREE.MeshBasicMaterial({
-          map: src.map || null,
-          color: src.map ? new THREE.Color(brightness, brightness, brightness) : (src.color ? src.color.clone().multiplyScalar(brightness) : new THREE.Color(brightness, brightness, brightness)),
-          alphaMap: src.alphaMap || null,
-          alphaTest,
-          side: THREE.DoubleSide,
-          transparent: isAlphaCutout ? false : !!src.transparent,
-          depthWrite: true
-        })
-      }
-
-      mat.needsUpdate = true
-      return mat
-    })
-
-    child.material = Array.isArray(child.material) ? tuned : tuned[0]
-    child.castShadow = false
-    child.receiveShadow = false
-  })
+    mat.diffuseColor = new Color3(0, 0, 0)
+    mat.specularColor = new Color3(0, 0, 0)
+    mat.ambientColor = new Color3(0, 0, 0)
+    mat.backFaceCulling = false
+    mat.disableLighting = true
+  }
 }
 
-  const camera = new THREE.PerspectiveCamera(
-    55,
-    window.innerWidth / window.innerHeight,
-    0.1,
-    1000
-  )
-  camera.layers.enable(1)
+  // Camera — manual orbit (we clear built-in inputs and detach from canvas)
+  const camera = new ArcRotateCamera('editorCam', 0.78, 1.02, 31, new Vector3(12, 2, 12), scene)
+  camera.fov = 55 * Math.PI / 180
+  camera.minZ = 0.1
+  camera.maxZ = 1000
+  camera.inputs.clear() // We handle camera manually
+  camera.detachControl() // Don't let Babylon.js attach any pointer handlers
 
-  const renderer = new THREE.WebGLRenderer({ antialias: true })
-  renderer.setSize(window.innerWidth, window.innerHeight)
-  renderer.outputColorSpace = THREE.SRGBColorSpace
-  renderer.toneMapping = THREE.ACESFilmicToneMapping
-  renderer.toneMappingExposure = 1.0
-  renderer.domElement.style.position = 'absolute'
-  renderer.domElement.style.inset = '0'
-  renderer.domElement.style.zIndex = '0'
-  container.appendChild(renderer.domElement)
+  // Water texture
+  const waterTexture = new Texture('/assets/textures/1.png', scene)
+  waterTexture.wrapU = Texture.WRAP_ADDRESSMODE
+  waterTexture.wrapV = Texture.WRAP_ADDRESSMODE
 
-  const textureLoader = new THREE.TextureLoader()
-  const waterTexture = textureLoader.load('/assets/textures/1.png')
-  waterTexture.wrapS = THREE.RepeatWrapping
-  waterTexture.wrapT = THREE.RepeatWrapping
-
-  const clock = new THREE.Timer()
-  const mixers = new Map()  // model -> AnimationMixer
+  // Babylon.js animations auto-update — no mixer management needed
+  // We keep a simple set of animation groups for cleanup
+  const _animGroups = new Map() // model -> AnimationGroup[]
 
   function setupModelAnimations(model, path) {
-    const clips = getAssetAnimations(path)
-    if (!clips.length) return
-    const mixer = new THREE.AnimationMixer(model)
-    for (const clip of clips) mixer.clipAction(clip).play()
-    mixers.set(model, mixer)
+    // Babylon.js GLB animations auto-play from loadAssetModel
+    // Nothing to do here — animations are already running
   }
 
   function disposeMixer(model) {
-    const mixer = mixers.get(model)
-    if (mixer) { mixer.stopAllAction(); mixers.delete(model) }
+    const groups = _animGroups.get(model)
+    if (groups) {
+      for (const ag of groups) { ag.stop(); ag.dispose() }
+      _animGroups.delete(model)
+    }
+  }
+
+  // Ensure Babylon.js nodes have .scale alias for .scaling and .userData
+  function ensureNodeCompat(node) {
+    if (!node.userData) node.userData = {}
+    if (!node.scale && node.scaling) {
+      Object.defineProperty(node, 'scale', { get() { return this.scaling }, set(v) { this.scaling.copyFrom(v) } })
+    }
   }
 
   function addPlacedModel(model) {
-    placedGroup.add(model)
+    ensureNodeCompat(model)
+    model.parent = placedGroup
     _spatialRegister(model)
     invalidateShadowCache()
     const asset = assetRegistry.find((a) => a.id === model.userData.assetId)
@@ -170,19 +161,18 @@ function tuneModelLighting(model, assetPath = '') {
     _spatialUnregister(model)
     invalidateShadowCache()
     disposeMixer(model)
-    placedGroup.remove(model)
+    model.dispose()
   }
 
   function clearPlacedModels() {
-    for (const model of placedGroup.children) disposeMixer(model)
+    for (const model of placedGroup.getChildren()) disposeMixer(model)
     _spatialGrid.clear()
     invalidateShadowCache()
-    placedGroup.clear()
+    for (const child of [...placedGroup.getChildren()]) child.dispose()
   }
 
   let map = new MapData(64, 64)
-  const placedGroup = new THREE.Group()
-  scene.add(placedGroup)
+  const placedGroup = new TransformNode('placedGroup', scene)
 
   let assetRegistry = []
   let filteredAssets = []
@@ -347,20 +337,17 @@ let brushRadius = 3.2
     }
   }
 
-  const raycaster = new THREE.Raycaster()
-  raycaster.layers.enable(1)
-  const mouse = new THREE.Vector2()
-
-  const highlightGeo = new THREE.PlaneGeometry(1, 1)
-  const highlightMat = new THREE.MeshBasicMaterial({
-    color: 0xffff00,
-    transparent: true,
-    opacity: 0.18,
-    side: THREE.DoubleSide
-  })
-  const highlight = new THREE.Mesh(highlightGeo, highlightMat)
-  highlight.rotation.x = -Math.PI / 2
-  scene.add(highlight)
+  // Highlight mesh for hovered tile
+  const highlight = MeshBuilder.CreatePlane('highlight', { size: 1 }, scene)
+  highlight.rotation.x = Math.PI / 2 // Face up in RHS
+  const highlightMat = new StandardMaterial('highlightMat', scene)
+  highlightMat.emissiveColor = new Color3(1, 1, 0)
+  highlightMat.diffuseColor = new Color3(0, 0, 0)
+  highlightMat.specularColor = new Color3(0, 0, 0)
+  highlightMat.disableLighting = true
+  highlightMat.alpha = 0.18
+  highlightMat.backFaceCulling = false
+  highlight.material = highlightMat
 
   const uiRoot = document.createElement('div')
   uiRoot.style.position = 'absolute'
@@ -820,16 +807,16 @@ let brushRadius = 3.2
 
   function applyLayerVisibility() {
     if (heightCullLevel > 0) { applyHeightCull(); return }
-    for (const obj of placedGroup.children) {
-      const layer = layers.find((l) => l.id === (obj.userData.layerId || 'layer_0'))
-      obj.visible = layer ? layer.visible : true
+    for (const obj of placedGroup.getChildren()) {
+      const layer = layers.find((l) => l.id === (obj.userData?.layerId || 'layer_0'))
+      obj.setEnabled(layer ? layer.visible : true)
     }
     if (texturePlaneGroup) {
-      for (const mesh of texturePlaneGroup.children) {
-        const plane = mesh.userData.texturePlane
+      for (const mesh of texturePlaneGroup.getChildMeshes()) {
+        const plane = mesh.userData?.texturePlane
         if (!plane) continue
         const layer = layers.find((l) => l.id === (plane.layerId || 'layer_0'))
-        mesh.visible = layer ? layer.visible : true
+        mesh.isVisible = layer ? layer.visible : true
       }
     }
   }
@@ -859,7 +846,7 @@ let brushRadius = 3.2
     }
 
     for (const layer of layers) {
-      const objCount = placedGroup.children.filter(
+      const objCount = placedGroup.getChildren().filter(
         (o) => (o.userData.layerId || 'layer_0') === layer.id
       ).length + map.texturePlanes.filter(
         (p) => (p.layerId || 'layer_0') === layer.id
@@ -929,7 +916,7 @@ let brushRadius = 3.2
       delBtn.addEventListener('click', (e) => {
         e.stopPropagation()
         const fallbackId = layers.find((l) => l.id !== layer.id)?.id || 'layer_0'
-        for (const obj of placedGroup.children) {
+        for (const obj of placedGroup.getChildren()) {
           if (obj.userData.layerId === layer.id) obj.userData.layerId = fallbackId
         }
         layers = layers.filter((l) => l.id !== layer.id)
@@ -1125,16 +1112,41 @@ let brushRadius = 3.2
 
   function setTool(mode) {
     state.tool = mode
-    if (hoverEdgeHelper) { scene.remove(hoverEdgeHelper); hoverEdgeHelper = null }
+    if (hoverEdgeHelper) { hoverEdgeHelper.dispose(); hoverEdgeHelper = null }
     updateToolUI()
     updatePreviewObject().catch(console.error)
   }
 
+  function createBoundingBoxHelper(target, color) {
+    try {
+      const bounds = target.getHierarchyBoundingVectors(true)
+      const min = bounds.min, max = bounds.max
+      if (!min || !max || (min.x === max.x && min.y === max.y && min.z === max.z)) return null
+      const lines = [
+        [new Vector3(min.x, min.y, min.z), new Vector3(max.x, min.y, min.z)],
+        [new Vector3(max.x, min.y, min.z), new Vector3(max.x, min.y, max.z)],
+        [new Vector3(max.x, min.y, max.z), new Vector3(min.x, min.y, max.z)],
+        [new Vector3(min.x, min.y, max.z), new Vector3(min.x, min.y, min.z)],
+        [new Vector3(min.x, max.y, min.z), new Vector3(max.x, max.y, min.z)],
+        [new Vector3(max.x, max.y, min.z), new Vector3(max.x, max.y, max.z)],
+        [new Vector3(max.x, max.y, max.z), new Vector3(min.x, max.y, max.z)],
+        [new Vector3(min.x, max.y, max.z), new Vector3(min.x, max.y, min.z)],
+        [new Vector3(min.x, min.y, min.z), new Vector3(min.x, max.y, min.z)],
+        [new Vector3(max.x, min.y, min.z), new Vector3(max.x, max.y, min.z)],
+        [new Vector3(max.x, min.y, max.z), new Vector3(max.x, max.y, max.z)],
+        [new Vector3(min.x, min.y, max.z), new Vector3(min.x, max.y, max.z)],
+      ]
+      const linesMesh = MeshBuilder.CreateLineSystem('selBox', { lines }, scene)
+      linesMesh.color = color
+      return linesMesh
+    } catch { return null }
+  }
+
   function clearSelectionHelper() {
     if (Array.isArray(selectionHelper)) {
-      for (const h of selectionHelper) scene.remove(h)
+      for (const h of selectionHelper) { if (h) h.dispose() }
     } else if (selectionHelper) {
-      scene.remove(selectionHelper)
+      selectionHelper.dispose()
     }
     selectionHelper = null
   }
@@ -1143,28 +1155,23 @@ let brushRadius = 3.2
     clearSelectionHelper()
 
     if (selectedPlacedObjects.length === 1) {
-      selectionHelper = new THREE.BoxHelper(selectedPlacedObjects[0], 0x66ccff)
-      scene.add(selectionHelper)
+      selectionHelper = createBoundingBoxHelper(selectedPlacedObjects[0], new Color3(0.4, 0.8, 1.0))
       return
     }
 
     if (selectedPlacedObjects.length > 1) {
       selectionHelper = selectedPlacedObjects.map((obj) => {
-        const h = new THREE.BoxHelper(obj, 0xffaa44)
-        scene.add(h)
-        return h
-      })
+        return createBoundingBoxHelper(obj, new Color3(1.0, 0.67, 0.27))
+      }).filter(Boolean)
       return
     }
 
     if (selectedTexturePlane && texturePlaneGroup) {
-      const color = selectedTexturePlanes.length > 1 ? 0xffaa44 : 0x66ccff
+      const color = selectedTexturePlanes.length > 1 ? new Color3(1.0, 0.67, 0.27) : new Color3(0.4, 0.8, 1.0)
       selectionHelper = selectedTexturePlanes.map((plane) => {
-        const mesh = texturePlaneGroup.children.find((c) => c.userData.texturePlane?.id === plane.id)
+        const mesh = texturePlaneGroup.getChildMeshes().find((c) => c.userData?.texturePlane?.id === plane.id)
         if (!mesh) return null
-        const h = new THREE.BoxHelper(mesh, color)
-        scene.add(h)
-        return h
+        return createBoundingBoxHelper(mesh, color)
       }).filter(Boolean)
     }
   }
@@ -1183,7 +1190,7 @@ let brushRadius = 3.2
   }
 
   function serializePlacedObjects() {
-    return placedGroup.children.map((obj) => {
+    return placedGroup.getChildren().map((obj) => {
       const out = {
         assetId: obj.userData.assetId || null,
         layerId: obj.userData.layerId || 'layer_0',
@@ -1222,7 +1229,7 @@ let brushRadius = 3.2
       model.userData.layerId = placed.layerId || 'layer_0'
       if (placed.trigger) model.userData.trigger = { ...placed.trigger }
       const layer = layers.find((l) => l.id === model.userData.layerId)
-      model.visible = layer ? layer.visible : true
+      model.setEnabled(layer ? layer.visible : true)
       addPlacedModel(model)
     }
   }
@@ -1346,7 +1353,7 @@ let brushRadius = 3.2
       model.userData.layerId = placed.layerId || activeLayerId
       if (placed.trigger) model.userData.trigger = { ...placed.trigger }
       const _layer = layers.find((l) => l.id === model.userData.layerId)
-      model.visible = _layer ? _layer.visible : true
+      model.setEnabled(_layer ? _layer.visible : true)
       addPlacedModel(model)
     }
 
@@ -1412,27 +1419,27 @@ let brushRadius = 3.2
 
         if (tile.split === 'forward') {
           points.push(
-            new THREE.Vector3(x, h.tl + 0.03, z),
-            new THREE.Vector3(x + 1, h.br + 0.03, z + 1)
+            new Vector3(x, h.tl + 0.03, z),
+            new Vector3(x + 1, h.br + 0.03, z + 1)
           )
         } else {
           points.push(
-            new THREE.Vector3(x + 1, h.tr + 0.03, z),
-            new THREE.Vector3(x, h.bl + 0.03, z + 1)
+            new Vector3(x + 1, h.tr + 0.03, z),
+            new Vector3(x, h.bl + 0.03, z + 1)
           )
         }
       }
     }
 
-    const geometry = new THREE.BufferGeometry().setFromPoints(points)
-    const material = new THREE.LineBasicMaterial({
-      color: 0x000000,
-      transparent: true,
-      opacity: 0.15
-    })
-
-    const lines = new THREE.LineSegments(geometry, material)
-    lines.visible = state.showSplitLines
+    // Convert pairs of points to line system segments
+    const segments = []
+    for (let i = 0; i < points.length; i += 2) {
+      segments.push([points[i], points[i + 1]])
+    }
+    const lines = MeshBuilder.CreateLineSystem('splitLines', { lines: segments }, scene)
+    lines.color = new Color3(0, 0, 0)
+    lines.alpha = 0.15
+    lines.isVisible = state.showSplitLines
     return lines
   }
 
@@ -1446,34 +1453,38 @@ let brushRadius = 3.2
 
         // top edge
         points.push(
-          new THREE.Vector3(x,     h.tl + LIFT, z),
-          new THREE.Vector3(x + 1, h.tr + LIFT, z)
+          new Vector3(x,     h.tl + LIFT, z),
+          new Vector3(x + 1, h.tr + LIFT, z)
         )
         // left edge
         points.push(
-          new THREE.Vector3(x, h.tl + LIFT, z),
-          new THREE.Vector3(x, h.bl + LIFT, z + 1)
+          new Vector3(x, h.tl + LIFT, z),
+          new Vector3(x, h.bl + LIFT, z + 1)
         )
         // close the bottom and right borders
         if (z === map.height - 1) {
           points.push(
-            new THREE.Vector3(x,     h.bl + LIFT, z + 1),
-            new THREE.Vector3(x + 1, h.br + LIFT, z + 1)
+            new Vector3(x,     h.bl + LIFT, z + 1),
+            new Vector3(x + 1, h.br + LIFT, z + 1)
           )
         }
         if (x === map.width - 1) {
           points.push(
-            new THREE.Vector3(x + 1, h.tr + LIFT, z),
-            new THREE.Vector3(x + 1, h.br + LIFT, z + 1)
+            new Vector3(x + 1, h.tr + LIFT, z),
+            new Vector3(x + 1, h.br + LIFT, z + 1)
           )
         }
       }
     }
 
-    const geometry = new THREE.BufferGeometry().setFromPoints(points)
-    const material = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.18 })
-    const lines = new THREE.LineSegments(geometry, material)
-    lines.visible = state.showTileGrid
+    const segments = []
+    for (let i = 0; i < points.length; i += 2) {
+      segments.push([points[i], points[i + 1]])
+    }
+    const lines = MeshBuilder.CreateLineSystem('tileGrid', { lines: segments }, scene)
+    lines.color = new Color3(1, 1, 1)
+    lines.alpha = 0.18
+    lines.isVisible = state.showTileGrid
     return lines
   }
 
@@ -1484,18 +1495,15 @@ let brushRadius = 3.2
     const inf = []
     for (let i = 0; i < rows; i++) inf.push(new Float32Array(cols).fill(1.0))
 
-    // Force world matrices to be current before computing bounds
-    scene.updateMatrixWorld(true)
+    for (const obj of placedGroup.getChildren()) {
+      let _size
+      try {
+        const bounds = obj.getHierarchyBoundingVectors(true)
+        _size = { x: bounds.max.x - bounds.min.x, y: bounds.max.y - bounds.min.y, z: bounds.max.z - bounds.min.z }
+        if (_size.x === 0 && _size.y === 0 && _size.z === 0) continue
+      } catch { continue }
 
-    const _box  = new THREE.Box3()
-    const _size = new THREE.Vector3()
-
-    for (const obj of placedGroup.children) {
-      _box.setFromObject(obj)
-      if (_box.isEmpty()) continue
-      _box.getSize(_size)
-
-      const asset = assetRegistry.find((a) => a.id === obj.userData.assetId)
+      const asset = assetRegistry.find((a) => a.id === obj.userData?.assetId)
       const isModular = asset?.path?.toLowerCase().includes('modular assets') ?? false
       const isTree = asset?.name?.toLowerCase().includes('tree') ?? false
 
@@ -1531,14 +1539,7 @@ let brushRadius = 3.2
 
   function disposeGroup(group) {
     if (!group) return
-    group.traverse((obj) => {
-      if (obj.isMesh) {
-        obj.geometry?.dispose()
-        if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose())
-        else obj.material?.dispose()
-      }
-    })
-    scene.remove(group)
+    group.dispose()
   }
 
   function rebuildTerrain({ skipTexturePlanes = false, skipShadows = false, skipTextureOverlays = false, _heightsOnlyRegion = null } = {}) {
@@ -1548,42 +1549,38 @@ let brushRadius = 3.2
       _shadowInfluencesCache = shadowInf
       if (updateTerrainLandHeights(map, shadowInf, _heightsOnlyRegion.x1, _heightsOnlyRegion.z1, _heightsOnlyRegion.x2, _heightsOnlyRegion.z2)) {
         disposeGroup(cliffs)
-        cliffs = buildCliffMeshes(map)
-        scene.add(cliffs)
-        // Rebuild water meshes in-place so water appears immediately during sculpting
+        cliffs = buildCliffMeshes(map, scene)
+        // Rebuild water meshes so water appears immediately during sculpting
         if (terrainGroup) {
-          for (const child of [...terrainGroup.children]) {
+          for (const child of [...terrainGroup.getChildMeshes()]) {
             if (child.name === 'terrain-water' || child.name === 'terrain-surface-water') {
-              child.geometry?.dispose()
-              child.material?.dispose()
-              terrainGroup.remove(child)
+              child.dispose()
             }
           }
-          const wg = buildWaterMeshes(map, waterTexture)
-          for (const child of [...wg.children]) terrainGroup.add(child)
+          const wg = buildWaterMeshes(map, waterTexture, scene)
+          for (const child of [...wg.getChildren()]) { child.parent = terrainGroup }
+          wg.dispose() // dispose empty group shell
         }
         if (state.showSplitLines) {
-          if (splitLines) { splitLines.geometry?.dispose(); splitLines.material?.dispose(); scene.remove(splitLines) }
+          if (splitLines) splitLines.dispose()
           splitLines = buildSplitLines()
-          scene.add(splitLines)
         }
         if (state.showTileGrid) {
-          if (tileGrid) { tileGrid.geometry?.dispose(); tileGrid.material?.dispose(); scene.remove(tileGrid) }
+          if (tileGrid) tileGrid.dispose()
           tileGrid = buildTileGrid()
-          scene.add(tileGrid)
         }
         applyLayerVisibility()
         return
       }
-      // Partial update not available (e.g. map size changed) — fall through to full rebuild.
+      // Partial update not available — fall through to full rebuild.
     }
 
     disposeGroup(terrainGroup)
     disposeGroup(cliffs)
-    if (splitLines) { splitLines.geometry?.dispose(); splitLines.material?.dispose(); scene.remove(splitLines) }
-    if (tileGrid)   { tileGrid.geometry?.dispose();   tileGrid.material?.dispose();   scene.remove(tileGrid) }
-    if (!skipTextureOverlays && textureOverlayGroup) scene.remove(textureOverlayGroup)
-    if (!skipTexturePlanes && texturePlaneGroup) scene.remove(texturePlaneGroup)
+    if (splitLines) splitLines.dispose()
+    if (tileGrid) tileGrid.dispose()
+    if (!skipTextureOverlays && textureOverlayGroup) { textureOverlayGroup.dispose(); textureOverlayGroup = null }
+    if (!skipTexturePlanes && texturePlaneGroup) { texturePlaneGroup.dispose(); texturePlaneGroup = null }
 
     map.selectedTexturePlaneId = selectedTexturePlane ? selectedTexturePlane.id : null
 
@@ -1591,23 +1588,14 @@ let brushRadius = 3.2
     const shadowInf = _shadowInfluencesCache ?? buildObjectShadowInfluences()
     _shadowInfluencesCache = shadowInf
 
-    terrainGroup = buildTerrainMeshes(map, waterTexture, shadowInf)
-    cliffs = buildCliffMeshes(map)
+    terrainGroup = buildTerrainMeshes(map, waterTexture, shadowInf, scene)
+    cliffs = buildCliffMeshes(map, scene)
     splitLines = buildSplitLines()
     tileGrid = buildTileGrid()
-    if (!skipTextureOverlays) textureOverlayGroup = buildTextureOverlays(map, textureRegistry, textureCache)
-
-    scene.add(terrainGroup)
-    scene.add(cliffs)
-    scene.add(splitLines)
-    scene.add(tileGrid)
-    if (textureOverlayGroup) scene.add(textureOverlayGroup)
+    if (!skipTextureOverlays) textureOverlayGroup = buildTextureOverlays(map, textureRegistry, textureCache, scene)
 
     if (!skipTexturePlanes) {
-      texturePlaneGroup = buildTexturePlanes(map, textureRegistry, textureCache)
-      scene.add(texturePlaneGroup)
-    } else if (texturePlaneGroup) {
-      scene.add(texturePlaneGroup)
+      texturePlaneGroup = buildTexturePlanes(map, textureRegistry, textureCache, scene)
     }
 
     updateSelectionHelper()
@@ -1616,7 +1604,7 @@ let brushRadius = 3.2
 
   function updateTexturePlaneMeshTransform(plane) {
     if (!texturePlaneGroup) return
-    const mesh = texturePlaneGroup.children.find((m) => m.userData.texturePlane === plane)
+    const mesh = texturePlaneGroup.getChildMeshes().find((m) => m.userData?.texturePlane === plane)
     if (!mesh) return
     mesh.position.set(plane.position.x, plane.position.y, plane.position.z)
     mesh.rotation.set(plane.rotation?.x ?? 0, plane.rotation?.y ?? 0, plane.rotation?.z ?? 0)
@@ -1625,76 +1613,79 @@ let brushRadius = 3.2
   }
 
   function updateMouse(event) {
-    const rect = renderer.domElement.getBoundingClientRect()
-    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+    // Update Babylon.js pointer position from the event
+    const rect = canvas.getBoundingClientRect()
+    scene.pointerX = event.clientX - rect.left
+    scene.pointerY = event.clientY - rect.top
   }
 
   function getTerrainMeshes() {
     const meshes = []
     if (!terrainGroup) return meshes
-
-    terrainGroup.traverse((obj) => {
-      if (obj.isMesh) meshes.push(obj)
-    })
-
+    for (const child of terrainGroup.getChildMeshes()) meshes.push(child)
     return meshes
+  }
+
+  function isTerrainMesh(mesh) {
+    return terrainGroup && mesh.isDescendantOf(terrainGroup)
   }
 
   function pickTerrainPoint(event) {
     updateMouse(event)
-    raycaster.setFromCamera(mouse, camera)
-    const hits = raycaster.intersectObjects(getTerrainMeshes())
-    if (!hits.length) return null
-    return hits[0].point.clone()
+    const pick = scene.pick(scene.pointerX, scene.pointerY, (mesh) => isTerrainMesh(mesh))
+    if (!pick.hit) return null
+    return pick.pickedPoint.clone()
   }
 
-  const _hPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
-  const _hPlaneTarget = new THREE.Vector3()
   function pickHorizontalPlane(event, y = 0) {
     updateMouse(event)
-    raycaster.setFromCamera(mouse, camera)
-    _hPlane.constant = -y
-    raycaster.ray.intersectPlane(_hPlane, _hPlaneTarget)
-    return _hPlaneTarget.length() > 0.001 ? _hPlaneTarget.clone() : null
+    const ray = scene.createPickingRay(scene.pointerX, scene.pointerY, Matrix.Identity(), camera)
+    if (Math.abs(ray.direction.y) < 0.0001) return null
+    const t = -(ray.origin.y - y) / ray.direction.y
+    if (t < 0) return null
+    return new Vector3(
+      ray.origin.x + ray.direction.x * t,
+      y,
+      ray.origin.z + ray.direction.z * t
+    )
   }
-
-  const _surfaceQuat = new THREE.Quaternion()
 
   function pickSurfacePoint(event, excludeObjects = []) {
     updateMouse(event)
-    raycaster.setFromCamera(mouse, camera)
+    const ray = scene.createPickingRay(scene.pointerX, scene.pointerY, Matrix.Identity(), camera)
 
-    const terrainHits = raycaster.intersectObjects(getTerrainMeshes(), false)
+    // Pick terrain
+    const terrainPick = scene.pickWithRay(ray, (mesh) => isTerrainMesh(mesh))
 
-    // Pre-filter placed objects to those near the terrain hit point (or all if no terrain hit)
-    let eligible
-    if (terrainHits.length) {
-      const hp = terrainHits[0].point
-      const nearby = _spatialNearby(hp.x, hp.z, 24)
-      eligible = [...nearby].filter(o => o.visible && !excludeObjects.includes(o))
-    } else {
-      eligible = placedGroup.children.filter(o => o.visible && !excludeObjects.includes(o))
-    }
-    const placedHits = raycaster.intersectObjects(eligible, true).filter(hit => {
-      if (!hit.face) return false
-      hit.object.getWorldQuaternion(_surfaceQuat)
-      const worldNormalY = hit.face.normal.clone().applyQuaternion(_surfaceQuat).y
-      return worldNormalY > 0.5  // only upward-facing surfaces (roofs, floors)
+    // Pick placed objects (filter upward-facing)
+    const placedPick = scene.pickWithRay(ray, (mesh) => {
+      if (!mesh.isDescendantOf(placedGroup)) return false
+      if (!mesh.isVisible) return false
+      // Walk up to find root placed object
+      let node = mesh
+      while (node.parent && node.parent !== placedGroup) node = node.parent
+      return !excludeObjects.includes(node)
     })
 
-    const visiblePlanes = texturePlaneGroup ? texturePlaneGroup.children.filter(m => m.visible) : []
-    const planeHits = visiblePlanes.length
-      ? raycaster.intersectObjects(visiblePlanes, true).filter(hit => {
-          if (!hit.face) return false
-          hit.object.getWorldQuaternion(_surfaceQuat)
-          const worldNormalY = hit.face.normal.clone().applyQuaternion(_surfaceQuat).y
-          return worldNormalY > 0.5  // only horizontal texture planes
-        })
-      : []
+    // Pick texture planes
+    const planePick = texturePlaneGroup ? scene.pickWithRay(ray, (mesh) => {
+      return mesh.isDescendantOf(texturePlaneGroup) && mesh.isVisible
+    }) : null
 
-    const best = [...terrainHits, ...placedHits, ...planeHits].sort((a, b) => a.distance - b.distance)[0]
-    return best ? best.point.clone() : null
+    // Find closest hit with upward-facing normal
+    const candidates = []
+    if (terrainPick?.hit) candidates.push(terrainPick)
+    if (placedPick?.hit) {
+      const n = placedPick.getNormal(true)
+      if (n && n.y > 0.5) candidates.push(placedPick)
+    }
+    if (planePick?.hit) {
+      const n = planePick.getNormal(true)
+      if (n && n.y > 0.5) candidates.push(planePick)
+    }
+
+    candidates.sort((a, b) => a.distance - b.distance)
+    return candidates.length > 0 ? candidates[0].pickedPoint.clone() : null
   }
 
   function pickTile(event) {
@@ -1710,12 +1701,12 @@ let brushRadius = 3.2
 
   function pickPlacedObject(event) {
     updateMouse(event)
-    raycaster.setFromCamera(mouse, camera)
-    const visible = placedGroup.children.filter(o => o.visible)
-    const hits = raycaster.intersectObjects(visible, true)
-    if (!hits.length) return null
+    const pick = scene.pick(scene.pointerX, scene.pointerY, (mesh) => {
+      return mesh.isDescendantOf(placedGroup) && mesh.isVisible
+    })
+    if (!pick.hit) return null
 
-    let obj = hits[0].object
+    let obj = pick.pickedMesh
     while (obj.parent && obj.parent !== placedGroup) obj = obj.parent
     return obj
   }
@@ -1781,7 +1772,7 @@ let brushRadius = 3.2
     model.userData.type = 'asset'
     model.userData.layerId = placed.layerId || activeLayerId
     const _importLayer = layers.find((l) => l.id === model.userData.layerId)
-    model.visible = _importLayer ? _importLayer.visible : true
+    model.setEnabled(_importLayer ? _importLayer.visible : true)
     addPlacedModel(model)
   }
 
@@ -1792,43 +1783,42 @@ let brushRadius = 3.2
 
   function pickTexturePlane(event) {
     if (!texturePlaneGroup) return null
-
     updateMouse(event)
-    raycaster.setFromCamera(mouse, camera)
-    const visible = texturePlaneGroup.children.filter(m => m.visible)
-    const hits = raycaster.intersectObjects(visible, true)
-    if (!hits.length) return null
-    return hits[0].object
+    const pick = scene.pick(scene.pointerX, scene.pointerY, (mesh) => {
+      return mesh.isDescendantOf(texturePlaneGroup) && mesh.isVisible
+    })
+    return pick.hit ? pick.pickedMesh : null
   }
 
   // Returns { type: 'placed'|'plane', object, distance } for whichever is closest to camera
   function pickClosestSelectTarget(event) {
     updateMouse(event)
-    raycaster.setFromCamera(mouse, camera)
+    const ray = scene.createPickingRay(scene.pointerX, scene.pointerY, Matrix.Identity(), camera)
 
-    const visiblePlaced = placedGroup.children.filter(o => o.visible)
-    const placedHits = raycaster.intersectObjects(visiblePlaced, true)
-    const visiblePlanesSelect = texturePlaneGroup ? texturePlaneGroup.children.filter(m => m.visible) : []
-    const planeHits = visiblePlanesSelect.length
-      ? raycaster.intersectObjects(visiblePlanesSelect, true)
-      : []
+    const placedPick = scene.pickWithRay(ray, (mesh) => {
+      return mesh.isDescendantOf(placedGroup) && mesh.isVisible
+    })
 
-    const bestPlaced = placedHits[0] ?? null
-    const bestPlane = planeHits[0] ?? null
+    const planePick = texturePlaneGroup ? scene.pickWithRay(ray, (mesh) => {
+      return mesh.isDescendantOf(texturePlaneGroup) && mesh.isVisible
+    }) : null
+
+    const bestPlaced = placedPick?.hit ? placedPick : null
+    const bestPlane = planePick?.hit ? planePick : null
 
     if (!bestPlaced && !bestPlane) return null
 
     if (bestPlaced && (!bestPlane || bestPlaced.distance <= bestPlane.distance)) {
-      let obj = bestPlaced.object
+      let obj = bestPlaced.pickedMesh
       while (obj.parent && obj.parent !== placedGroup) obj = obj.parent
       return { type: 'placed', object: obj, distance: bestPlaced.distance }
     }
 
-    return { type: 'plane', object: bestPlane.object, distance: bestPlane.distance }
+    return { type: 'plane', object: bestPlane.pickedMesh, distance: bestPlane.distance }
   }
 
   function tileWorldPosition(x, z) {
-    return new THREE.Vector3(
+    return new Vector3(
       x + 0.5,
       map.getAverageTileHeight(x, z),
       z + 0.5
@@ -1848,33 +1838,38 @@ let brushRadius = 3.2
   }
 
   function getObjectFootprint(object) {
-    const box = new THREE.Box3().setFromObject(object)
-    const size = new THREE.Vector3()
-    box.getSize(size)
-
+    const bounds = object.getHierarchyBoundingVectors(true)
+    const sizeX = bounds.max.x - bounds.min.x
+    const sizeY = bounds.max.y - bounds.min.y
+    const sizeZ = bounds.max.z - bounds.min.z
     return {
-      width: Math.max(size.x, 0.1),
-      depth: Math.max(size.z, 0.1),
-      height: Math.max(size.y, 0.1)
+      width: Math.max(sizeX, 0.1),
+      depth: Math.max(sizeZ, 0.1),
+      height: Math.max(sizeY, 0.1)
     }
   }
 
   function scaleObjectToTiles(obj, tiles) {
-    // Preserve Y (height) scale — only change horizontal (X/Z)
-    const prevYScale = obj.scale.y
-    obj.scale.set(1, 1, 1)
-    obj.updateWorldMatrix(true, true)
-    const box = new THREE.Box3().setFromObject(obj)
-    const size = new THREE.Vector3()
-    box.getSize(size)
-    const naturalLength = Math.max(size.x, size.z)
-    if (naturalLength < 0.001) {
-      obj.scale.set(1, prevYScale, 1)
-      return
+    const prevYScale = obj.scaling?.y ?? obj.scale?.y ?? 1
+    if (obj.scaling) obj.scaling.set(1, 1, 1)
+    else if (obj.scale) obj.scale.set(1, 1, 1)
+    obj.computeWorldMatrix?.(true)
+    try {
+      const bounds = obj.getHierarchyBoundingVectors(true)
+      const naturalLength = Math.max(bounds.max.x - bounds.min.x, bounds.max.z - bounds.min.z)
+      if (naturalLength < 0.001) {
+        if (obj.scaling) obj.scaling.set(1, prevYScale, 1)
+        else if (obj.scale) obj.scale.set(1, prevYScale, 1)
+        return
+      }
+      const s = tiles / naturalLength
+      if (obj.scaling) obj.scaling.set(s, prevYScale, s)
+      else if (obj.scale) obj.scale.set(s, prevYScale, s)
+      obj.computeWorldMatrix?.(true)
+    } catch {
+      if (obj.scaling) obj.scaling.set(1, prevYScale, 1)
+      else if (obj.scale) obj.scale.set(1, prevYScale, 1)
     }
-    const s = tiles / naturalLength
-    obj.scale.set(s, prevYScale, s)
-    obj.updateWorldMatrix(true, true)
   }
 
   function snapValue(value, step = 0.5) {
@@ -1900,11 +1895,11 @@ let brushRadius = 3.2
     const THRESHOLD = 0.65
 
     // Local extents relative to the object's position (constant while translating)
-    const movingBox = new THREE.Box3().setFromObject(movingObj)
-    const lMinX = movingBox.min.x - movingObj.position.x
-    const lMaxX = movingBox.max.x - movingObj.position.x
-    const lMinZ = movingBox.min.z - movingObj.position.z
-    const lMaxZ = movingBox.max.z - movingObj.position.z
+    const movingBounds = movingObj.getHierarchyBoundingVectors(true)
+    const lMinX = movingBounds.min.x - movingObj.position.x
+    const lMaxX = movingBounds.max.x - movingObj.position.x
+    const lMinZ = movingBounds.min.z - movingObj.position.z
+    const lMaxZ = movingBounds.max.z - movingObj.position.z
 
     // Predicted bbox at target position
     const tMinX = targetX + lMinX
@@ -1915,11 +1910,12 @@ let brushRadius = 3.2
     let bestX = null, bestZ = null
     let bestDX = THRESHOLD, bestDZ = THRESHOLD
 
-    for (const other of placedGroup.children) {
+    for (const other of placedGroup.getChildren()) {
       if (selectedPlacedObjects.includes(other)) continue
-      if (!isModularAsset(other.userData.assetId)) continue
+      if (!isModularAsset(other.userData?.assetId)) continue
 
-      const ob = new THREE.Box3().setFromObject(other)
+      let ob
+      try { const b = other.getHierarchyBoundingVectors(true); ob = { min: b.min, max: b.max } } catch { continue }
 
       // X: my left→other right, my right→other left, center align
       for (const [d, snap] of [
@@ -2008,14 +2004,12 @@ let brushRadius = 3.2
   function findTexturePlaneTopAt(event) {
     if (!texturePlaneGroup) return null
     updateMouse(event)
-    raycaster.setFromCamera(mouse, camera)
-    const visible = texturePlaneGroup.children.filter(m => m.visible)
-    const hits = raycaster.intersectObjects(visible, true)
-    for (const hit of hits) {
-      if (!hit.face) continue
-      hit.object.getWorldQuaternion(_surfaceQuat)
-      const normalY = hit.face.normal.clone().applyQuaternion(_surfaceQuat).y
-      if (normalY > 0.5) return hit.point.y
+    const pick = scene.pick(scene.pointerX, scene.pointerY, (mesh) => {
+      return mesh.isDescendantOf(texturePlaneGroup) && mesh.isVisible
+    })
+    if (pick.hit) {
+      const n = pick.getNormal(true)
+      if (n && n.y > 0.5) return pick.pickedPoint.y
     }
     return null
   }
@@ -2026,7 +2020,7 @@ let brushRadius = 3.2
     const candidates = _spatialNearby(worldX, worldZ, SPATIAL_CELL * 2)
     for (const obj of candidates) {
       if (excludeObjects.includes(obj)) continue
-      if (!obj.visible) continue
+      if (obj.isEnabled && !obj.isEnabled()) continue
 
       // Use static bounds from load time to avoid animated sub-meshes inflating the box
       const bounds = obj.userData.bounds
@@ -2042,9 +2036,10 @@ let brushRadius = 3.2
           bestTop = top
         }
       } else {
-        obj.updateWorldMatrix(true, true)
-        const box = new THREE.Box3().setFromObject(obj)
-        if (box.isEmpty()) continue
+        obj.computeWorldMatrix(true)
+        const _b = obj.getHierarchyBoundingVectors(true)
+        const box = { min: _b.min, max: _b.max }
+        if (box.min.x === box.max.x && box.min.y === box.max.y) continue
         if (
           worldX >= box.min.x - MARGIN && worldX <= box.max.x + MARGIN &&
           worldZ >= box.min.z - MARGIN && worldZ <= box.max.z + MARGIN &&
@@ -2107,7 +2102,7 @@ let brushRadius = 3.2
     const sourceExtent = ax * sourceFootprint.width + az * sourceFootprint.depth
     const spacing = (targetExtent + sourceExtent) * 0.5
 
-    return new THREE.Vector3(
+    return new Vector3(
       basePosition.x + vec.x * spacing * sign,
       basePosition.y,
       basePosition.z + vec.z * spacing * sign
@@ -2331,7 +2326,7 @@ function applyToolAtTile(tile, eventLike = null) {
   }
 
   function updateHoverEdgeHelper() {
-    if (hoverEdgeHelper) { scene.remove(hoverEdgeHelper); hoverEdgeHelper = null }
+    if (hoverEdgeHelper) { hoverEdgeHelper.dispose(); hoverEdgeHelper = null }
 
     if (state.tool !== ToolMode.PLACE) return
     const asset = assetRegistry.find((a) => a.id === selectedAssetId)
@@ -2352,31 +2347,31 @@ function applyToolAtTile(tile, eventLike = null) {
     const dists = [u, 1 - u, v, 1 - v]
     const nearestIdx = dists.indexOf(Math.min(...dists))
 
-    const group = new THREE.Group()
+    const group = new TransformNode('hoverEdge', scene)
     const S = 0.22
 
     for (let i = 0; i < 4; i++) {
       const { px, pz, ht } = edges[i]
       const y = ht + 0.06
       const active = i === nearestIdx
-      const color = active ? 0x55aaff : 0x2255aa
-      const opacity = active ? 1.0 : 0.45
-      const pts = [
-        new THREE.Vector3(px - S, y, pz), new THREE.Vector3(px + S, y, pz),
-        new THREE.Vector3(px, y, pz - S), new THREE.Vector3(px, y, pz + S),
+      const c = active ? new Color3(0.33, 0.67, 1.0) : new Color3(0.13, 0.33, 0.67)
+      const alpha = active ? 1.0 : 0.45
+      const segs = [
+        [new Vector3(px - S, y, pz), new Vector3(px + S, y, pz)],
+        [new Vector3(px, y, pz - S), new Vector3(px, y, pz + S)],
       ]
-      const geo = new THREE.BufferGeometry().setFromPoints(pts)
-      const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity })
-      group.add(new THREE.LineSegments(geo, mat))
+      const linesMesh = MeshBuilder.CreateLineSystem(`edgeLine_${i}`, { lines: segs }, scene)
+      linesMesh.color = c
+      linesMesh.alpha = alpha
+      linesMesh.parent = group
     }
 
     hoverEdgeHelper = group
-    scene.add(hoverEdgeHelper)
   }
 
   async function updatePreviewObject() {
     if (previewObject) {
-      scene.remove(previewObject)
+      previewObject.dispose()
       previewObject = null
     }
 
@@ -2395,14 +2390,14 @@ function applyToolAtTile(tile, eventLike = null) {
     previewObject = makeGhostMaterial(model)
     previewObject.rotation.y = previewRotation
     previewObject.userData.assetId = asset.id
-    scene.add(previewObject)
+    // previewObject is already in the scene from makeGhostMaterial
 
     const pos = tileWorldPosition(state.hovered.x, state.hovered.z)
     if (asset.name?.toLowerCase().includes('wall')) {
       const snap = getWallEdgeSnap(state.hovered)
       if (snap) { pos.x = snap.x; pos.z = snap.z }
     }
-    previewObject.position.copy(pos)
+    previewObject.position.copyFrom(pos)
   }
 
   async function placeSelectedAsset(tile, event) {
@@ -2439,7 +2434,7 @@ function applyToolAtTile(tile, eventLike = null) {
       pos.x = Math.round(pos.x)
       pos.z = Math.round(pos.z)
     }
-    model.position.copy(pos)
+    model.position.copyFrom(pos)
     model.rotation.y = previewRotation
     model.userData.assetId = asset.id
     model.userData.type = 'asset'
@@ -2468,14 +2463,14 @@ function applyToolAtTile(tile, eventLike = null) {
     for (const obj of [...selectedPlacedObjects]) {
       const model = await loadAssetModel(newAsset.path)
       tuneModelLighting(model, newAsset.path)
-      model.position.copy(obj.position)
-      model.rotation.copy(obj.rotation)
-      model.scale.copy(obj.scale)
+      model.position.copyFrom(obj.position)
+      model.rotation.copyFrom(obj.rotation)
+      model.scale.copyFrom(obj.scale)
       model.userData.assetId = newAsset.id
       model.userData.type = 'asset'
       model.userData.layerId = obj.userData.layerId || activeLayerId
       const _rLayer = layers.find((l) => l.id === model.userData.layerId)
-      model.visible = _rLayer ? _rLayer.visible : true
+      model.setEnabled(_rLayer ? _rLayer.visible : true)
       removePlacedModel(obj)
       addPlacedModel(model)
       replacements.push(model)
@@ -2550,7 +2545,7 @@ function applyToolAtTile(tile, eventLike = null) {
     }
 
     if (selectedPlacedObjects.length > 1) {
-      let offsetVec = new THREE.Vector3()
+      let offsetVec = new Vector3()
 
       if (mode !== 'stack') {
         const primaryFootprint = getObjectFootprint(selectedPlacedObject)
@@ -2561,7 +2556,7 @@ function applyToolAtTile(tile, eventLike = null) {
           primaryFootprint,
           ['forward','back'].includes(mode) ? mode : (mode === 'left' ? 'left' : 'right')
         )
-        offsetVec = newPos.clone().sub(selectedPlacedObject.position)
+        offsetVec = newPos.subtract(selectedPlacedObject.position)
       }
 
       const newModels = []
@@ -2572,21 +2567,21 @@ function applyToolAtTile(tile, eventLike = null) {
 
         const model = await loadAssetModel(asset.path)
         tuneModelLighting(model, asset.path)
-        model.rotation.copy(src.rotation)
-        model.scale.copy(src.scale)
+        model.rotation.copyFrom(src.rotation)
+        model.scale.copyFrom(src.scale)
         model.userData.assetId = asset.id
         model.userData.type = 'asset'
         model.userData.layerId = src.userData.layerId || activeLayerId
         addPlacedModel(model)
-        model.updateMatrixWorld(true)
+        model.computeWorldMatrix(true)
 
         if (mode === 'stack') {
           const srcFootprint = getObjectFootprint(src)
           const cloneFootprint = getObjectFootprint(model)
-          model.position.copy(src.position)
+          model.position.copyFrom(src.position)
           model.position.y += (srcFootprint.height + cloneFootprint.height) * 0.5
         } else {
-          model.position.copy(src.position).add(offsetVec)
+          model.position.copyFrom(src.position.add(offsetVec))
         }
 
         newModels.push(model)
@@ -2613,22 +2608,22 @@ function applyToolAtTile(tile, eventLike = null) {
 
       const targetFootprint = getObjectFootprint(selectedPlacedObject)
 
-      model.rotation.copy(selectedPlacedObject.rotation)
-      model.scale.copy(selectedPlacedObject.scale)
+      model.rotation.copyFrom(selectedPlacedObject.rotation)
+      model.scale.copyFrom(selectedPlacedObject.scale)
       model.userData.assetId = asset.id
       model.userData.type = 'asset'
       model.userData.layerId = selectedPlacedObject.userData.layerId || activeLayerId
 
       addPlacedModel(model)
-      model.updateMatrixWorld(true)
+      model.computeWorldMatrix(true)
 
       const sourceFootprint = getObjectFootprint(model)
 
       if (mode === 'stack') {
-        model.position.copy(selectedPlacedObject.position)
+        model.position.copyFrom(selectedPlacedObject.position)
         model.position.y += (targetFootprint.height + sourceFootprint.height) * 0.5
       } else {
-        model.position.copy(
+        model.position.copyFrom(
           snapObjectFlushAlongPosition(
             selectedPlacedObject.position,
             selectedPlacedObject.rotation.y,
@@ -2702,17 +2697,17 @@ function applyToolAtTile(tile, eventLike = null) {
     }
 
     if (selectedPlacedObject) {
-      selectedPlacedObject.position.copy(transformStart.position)
+      selectedPlacedObject.position.copyFrom(transformStart.position)
       selectedPlacedObject.rotation.set(
         transformStart.rotation.x,
         transformStart.rotation.y,
         transformStart.rotation.z
       )
-      selectedPlacedObject.scale.copy(transformStart.scale)
+      selectedPlacedObject.scale.copyFrom(transformStart.scale)
 
       if (transformStart.groupStarts?.length) {
         for (const { obj, position, rotation } of transformStart.groupStarts) {
-          obj.position.copy(position)
+          obj.position.copyFrom(position)
           if (rotation) obj.rotation.set(rotation.x, rotation.y, rotation.z)
         }
       }
@@ -2794,18 +2789,23 @@ function applyToolAtTile(tile, eventLike = null) {
 
   function initThumbRenderer() {
     if (thumbRenderer) return
-    thumbRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
-    thumbRenderer.setSize(80, 80)
-    thumbRenderer.outputColorSpace = THREE.SRGBColorSpace
+    const thumbCanvas = document.createElement('canvas')
+    thumbCanvas.width = 80
+    thumbCanvas.height = 80
+    thumbRenderer = new Engine(thumbCanvas, true, { antialias: true })
 
-    thumbScene = new THREE.Scene()
-    thumbScene.background = new THREE.Color(0x1e2230)
-    thumbScene.add(new THREE.AmbientLight(0xffffff, 0.75))
-    const dirLight = new THREE.DirectionalLight(0xffffff, 1.3)
-    dirLight.position.set(4, 7, 5)
-    thumbScene.add(dirLight)
+    thumbScene = new Scene(thumbRenderer)
+    thumbScene.useRightHandedSystem = true
+    thumbScene.clearColor = new Color4(0.118, 0.133, 0.188, 1.0) // 0x1e2230
+    new HemisphericLight('thumbAmbient', new Vector3(0, 1, 0), thumbScene).intensity = 0.75
+    const dirLight = new DirectionalLight('thumbDir', new Vector3(-0.5, -1, -0.65), thumbScene)
+    dirLight.intensity = 1.3
 
-    thumbCamera = new THREE.PerspectiveCamera(40, 1, 0.001, 10000)
+    thumbCamera = new ArcRotateCamera('thumbCam', 0.78, 0.9, 5, Vector3.Zero(), thumbScene)
+    thumbCamera.fov = 40 * Math.PI / 180
+    thumbCamera.minZ = 0.001
+    thumbCamera.maxZ = 10000
+    thumbCamera.inputs.clear()
   }
 
   async function generateThumbnail(asset) {
@@ -2820,33 +2820,31 @@ function applyToolAtTile(tile, eventLike = null) {
       return null
     }
 
-    if (isStoneModularAsset(asset)) {
-      model.scale.y = 1
+    // Generate a simple colored placeholder thumbnail via canvas
+    if (model) model.dispose()
+    const thumbCanvas = document.createElement('canvas')
+    thumbCanvas.width = 80
+    thumbCanvas.height = 80
+    const ctx = thumbCanvas.getContext('2d')
+    // Color based on asset category
+    const pathLower = asset.path?.toLowerCase() || ''
+    if (pathLower.includes('white')) ctx.fillStyle = '#889'
+    else if (pathLower.includes('wood')) ctx.fillStyle = '#654'
+    else if (pathLower.includes('dark stone')) ctx.fillStyle = '#433'
+    else if (pathLower.includes('stone')) ctx.fillStyle = '#776'
+    else if (pathLower.includes('tree')) ctx.fillStyle = '#264'
+    else if (pathLower.includes('rock')) ctx.fillStyle = '#554'
+    else ctx.fillStyle = '#445'
+    ctx.fillRect(0, 0, 80, 80)
+    ctx.fillStyle = '#fff'
+    ctx.font = '10px sans-serif'
+    ctx.textAlign = 'center'
+    const name = asset.name || asset.id || '?'
+    const words = name.split(/\s+/)
+    for (let i = 0; i < words.length && i < 4; i++) {
+      ctx.fillText(words[i], 40, 30 + i * 14)
     }
-
-    // Recompute bounds after any scaling
-    const scaledBox = new THREE.Box3().setFromObject(model)
-    const scaledSize = new THREE.Vector3()
-    scaledBox.getSize(scaledSize)
-    const bounds = { width: scaledSize.x, height: scaledSize.y, depth: scaledSize.z }
-    const maxDim = Math.max(bounds.width, bounds.height, bounds.depth, 0.01)
-
-    // model is bottom-center pivoted — shift down so it's truly centered
-    model.position.set(0, -bounds.height / 2, 0)
-    thumbScene.add(model)
-
-    const fovRad = (40 * Math.PI) / 180
-    const dist = (maxDim / 2) / Math.tan(fovRad / 2) * 1.6
-    thumbCamera.position.set(dist * 0.75, dist * 0.55, dist * 0.75)
-    thumbCamera.lookAt(0, 0, 0)
-    thumbCamera.near = dist * 0.01
-    thumbCamera.far = dist * 10
-    thumbCamera.updateProjectionMatrix()
-
-    thumbRenderer.render(thumbScene, thumbCamera)
-    const dataUrl = thumbRenderer.domElement.toDataURL()
-
-    thumbScene.remove(model)
+    const dataUrl = thumbCanvas.toDataURL()
     thumbnailCache.set(asset.id, dataUrl)
     return dataUrl
   }
@@ -3292,27 +3290,27 @@ function applyToolAtTile(tile, eventLike = null) {
     map.mapType = isDungeon ? 'dungeon' : 'overworld'
 
     if (isDungeon) {
-      scene.background = new THREE.Color(0x000000)
-      scene.fog = new THREE.Fog(0x000000, 18, 48)
+      scene.clearColor = new Color4(0, 0, 0, 1)
+      scene.fogColor = new Color3(0, 0, 0)
+      scene.fogStart = 18
+      scene.fogEnd = 48
       sun.intensity = 0.3
-      sun.color.set(0x6a4a20)
-      fillLight.intensity = 0.25
-      fillLight.color.set(0x4a3010)
-      ambientMain.color.set(0x7a6040)
-      ambientMain.intensity = 0.85
-      ambientGreen.intensity = 0.0
-      hemiLight.intensity = 0.0
+      sun.diffuse = new Color3(0.42, 0.29, 0.13)
+      fill.intensity = 0.25
+      fill.diffuse = new Color3(0.29, 0.19, 0.06)
+      ambient.diffuse = new Color3(0.48, 0.38, 0.25)
+      ambient.intensity = 0.85
     } else {
-      scene.background = new THREE.Color(0x0a1205)
-      scene.fog = new THREE.Fog(0x0a1205, 22, 72)
+      scene.clearColor = new Color4(0.039, 0.071, 0.020, 1)
+      scene.fogColor = new Color3(0.039, 0.071, 0.020)
+      scene.fogStart = 22
+      scene.fogEnd = 72
       sun.intensity = 1.1
-      sun.color.set(0xffd78a)
-      fillLight.intensity = 0.65
-      fillLight.color.set(0xaabbcc)
-      ambientMain.color.set(0x8a8a8a)
-      ambientMain.intensity = 0.62
-      ambientGreen.intensity = 0.08
-      hemiLight.intensity = 0.18
+      sun.diffuse = new Color3(1.0, 0.84, 0.54)
+      fill.intensity = 0.65
+      fill.diffuse = new Color3(0.67, 0.73, 0.80)
+      ambient.diffuse = new Color3(0.54, 0.54, 0.54)
+      ambient.intensity = 0.9
     }
 
     GROUND_TYPES = isDungeon ? GROUND_TYPES_DUNGEON : GROUND_TYPES_OVERWORLD
@@ -3356,12 +3354,12 @@ function applyToolAtTile(tile, eventLike = null) {
 
   sidebar.querySelector('#toggleSplitLines').addEventListener('change', (e) => {
     state.showSplitLines = e.target.checked
-    if (splitLines) splitLines.visible = state.showSplitLines
+    if (splitLines) splitLines.isVisible = state.showSplitLines
   })
 
   sidebar.querySelector('#toggleTileGrid').addEventListener('change', (e) => {
     state.showTileGrid = e.target.checked
-    if (tileGrid) tileGrid.visible = state.showTileGrid
+    if (tileGrid) tileGrid.isVisible = state.showTileGrid
   })
 
   sidebar.querySelector('#toggleHalfPaint').addEventListener('change', (e) => {
@@ -3435,7 +3433,7 @@ function applyToolAtTile(tile, eventLike = null) {
     }
   })
 
-  renderer.domElement.addEventListener('mousemove', (event) => {
+  canvas.addEventListener('mousemove', (event) => {
     const tile = pickTile(event)
     if (!tile) return
 
@@ -3458,7 +3456,7 @@ function applyToolAtTile(tile, eventLike = null) {
         if (sp) { pos.x = Math.round(sp.x); pos.z = Math.round(sp.z) }
         else { pos.x = Math.round(tile.x + 0.5); pos.z = Math.round(tile.z + 0.5) }
       }
-      previewObject.position.copy(pos)
+      previewObject.position.copyFrom(pos)
     }
     updateHoverEdgeHelper()
 
@@ -3624,15 +3622,20 @@ if (state.isPainting && state.tool !== ToolMode.PLACE && state.tool !== ToolMode
   }
 
   function worldToScreen(worldPos) {
-    const v = worldPos.clone().project(camera)
-    const rect = renderer.domElement.getBoundingClientRect()
+    const projected = Vector3.Project(
+      worldPos,
+      Matrix.Identity(),
+      scene.getTransformMatrix(),
+      camera.viewport.toGlobal(engine.getRenderWidth(), engine.getRenderHeight())
+    )
+    const rect = canvas.getBoundingClientRect()
     return {
-      x: (v.x * 0.5 + 0.5) * rect.width + rect.left,
-      y: (-v.y * 0.5 + 0.5) * rect.height + rect.top
+      x: projected.x + rect.left,
+      y: projected.y + rect.top
     }
   }
 
-  renderer.domElement.addEventListener('mousedown', async (event) => {
+  canvas.addEventListener('mousedown', async (event) => {
     if (event.button !== 0) return
 
     // SELECT tool drag-select starts before tile check so it works anywhere on canvas
@@ -3776,7 +3779,7 @@ if (state.isPainting && state.tool !== ToolMode.PLACE && state.tool !== ToolMode
             selectedPlacedObject = null
           }
 
-          for (const obj of placedGroup.children) {
+          for (const obj of placedGroup.getChildren()) {
             const s = worldToScreen(obj.position)
             if (s.x >= left && s.x <= right && s.y >= top && s.y <= bottom) {
               if (!selectedPlacedObjects.includes(obj)) selectedPlacedObjects.push(obj)
@@ -3802,7 +3805,7 @@ if (state.isPainting && state.tool !== ToolMode.PLACE && state.tool !== ToolMode
   let yaw = 0.78
   let pitch = 1.02
   let distance = 31
-  const target = new THREE.Vector3(12, 2, 12)
+  const target = new Vector3(12, 2, 12)
   let heightCullLevel = 0 // 0=off, 1=at camera height, 2=one level higher
   const HEIGHT_CULL_STEP = 3
 
@@ -3810,51 +3813,52 @@ if (state.isPainting && state.tool !== ToolMode.PLACE && state.tool !== ToolMode
     const cullThreshold = heightCullLevel === 0 ? Infinity
       : heightCullLevel === 1 ? target.y
       : target.y + HEIGHT_CULL_STEP
-    for (const obj of placedGroup.children) {
+    for (const obj of placedGroup.getChildren()) {
       const layer = layers.find((l) => l.id === (obj.userData.layerId || 'layer_0'))
       const layerVisible = layer ? layer.visible : true
-      obj.visible = layerVisible && obj.position.y <= cullThreshold
+      obj.setEnabled(layerVisible && obj.position.y <= cullThreshold)
     }
     if (texturePlaneGroup) {
-      for (const mesh of texturePlaneGroup.children) {
+      for (const mesh of texturePlaneGroup.getChildMeshes()) {
         const plane = mesh.userData.texturePlane
         if (!plane) continue
         const layer = layers.find((l) => l.id === (plane.layerId || 'layer_0'))
         const layerVisible = layer ? layer.visible : true
-        mesh.visible = layerVisible && plane.position.y <= cullThreshold
+        mesh.isVisible = layerVisible && plane.position.y <= cullThreshold
       }
     }
   }
 
   function updateCamera() {
-    camera.position.x = target.x + Math.cos(yaw) * Math.sin(pitch) * distance
-    camera.position.y = target.y + Math.cos(pitch) * distance
-    camera.position.z = target.z + Math.sin(yaw) * Math.sin(pitch) * distance
-    camera.lookAt(target)
+    // Three.js convention: yaw=0 faces +X, pitch=PI/4 is 45deg down
+    // Babylon ArcRotateCamera (RHS): alpha=horizontal angle, beta=vertical (0=top, PI/2=horizon)
+    // The original Three.js computed position as:
+    //   x = cos(yaw)*sin(pitch)*dist, y = cos(pitch)*dist, z = sin(yaw)*sin(pitch)*dist
+    // Babylon alpha rotates around Y axis, beta tilts from pole
+    camera.alpha = yaw + Math.PI / 2
+    camera.beta = pitch
+    camera.radius = distance
+    camera.target.copyFrom(target)
     updateCompass()
     if (heightCullLevel > 0) applyHeightCull()
   }
 
   function panCamera(deltaX, deltaY) {
-    const forward = new THREE.Vector3()
-    camera.getWorldDirection(forward)
-    forward.y = 0
-    forward.normalize()
-
-    const right = new THREE.Vector3()
-    right.crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize()
+    // Compute forward/right from yaw
+    const fx = Math.sin(yaw), fz = Math.cos(yaw)
+    const rx = Math.cos(yaw), rz = -Math.sin(yaw)
 
     const panScale = distance * 0.0025
-    target.addScaledVector(right, -deltaX * panScale)
-    target.addScaledVector(forward, deltaY * panScale)
+    target.x += -deltaX * panScale * rx + deltaY * panScale * fx
+    target.z += -deltaX * panScale * rz + deltaY * panScale * fz
     updateCamera()
   }
 
   updateCamera()
 
-  renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault())
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault())
 
-  renderer.domElement.addEventListener('mousedown', (e) => {
+  canvas.addEventListener('mousedown', (e) => {
     if (e.button === 2) isRightDragging = true
     if (e.button === 1) {
       if (e.shiftKey) isMiddlePanning = true
@@ -3883,7 +3887,7 @@ if (state.isPainting && state.tool !== ToolMode.PLACE && state.tool !== ToolMode
     }
   })
 
-  renderer.domElement.addEventListener('wheel', (e) => {
+  canvas.addEventListener('wheel', (e) => {
     if (transformMode === 'rotate') {
       e.preventDefault()
 
@@ -3917,8 +3921,12 @@ if (state.isPainting && state.tool !== ToolMode.PLACE && state.tool !== ToolMode
             if (!e.shiftKey) obj.rotation.y = snapAngleToQuarterIfClose(obj.rotation.y, 0.08)
           } else {
             // X/Z: rotate around absolute world axis to avoid gimbal lock from GLTF baked rotations
-            const worldAxis = threeAxis === 'x' ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1)
-            obj.rotateOnWorldAxis(worldAxis, delta)
+            const worldAxis = threeAxis === 'x' ? new Vector3(1, 0, 0) : new Vector3(0, 0, 1)
+            { // rotateOnWorldAxis equivalent
+              const q = Quaternion.RotationAxis(worldAxis, delta)
+              if (!obj.rotationQuaternion) obj.rotationQuaternion = Quaternion.FromEulerAngles(obj.rotation.x, obj.rotation.y, obj.rotation.z)
+              obj.rotationQuaternion = q.multiply(obj.rotationQuaternion)
+            }
           }
         }
 
@@ -3981,9 +3989,7 @@ if (state.isPainting && state.tool !== ToolMode.PLACE && state.tool !== ToolMode
   })
 
   window.addEventListener('resize', () => {
-    camera.aspect = window.innerWidth / window.innerHeight
-    camera.updateProjectionMatrix()
-    renderer.setSize(window.innerWidth, window.innerHeight)
+    engine.resize()
   })
 
   window.addEventListener('keydown', async (event) => {
@@ -4128,12 +4134,10 @@ if (key === 'e') {
     if (key === 'g') {
       // If nothing is selected, try to pick whatever is under the cursor
       if (!selectedTexturePlane && !selectedPlacedObject) {
-        raycaster.setFromCamera(mouse, camera)
-
         if (texturePlaneGroup) {
-          const hits = raycaster.intersectObjects(texturePlaneGroup.children, true)
-          if (hits.length && hits[0].object?.userData?.texturePlane) {
-            selectedTexturePlane = hits[0].object.userData.texturePlane
+          const pick = scene.pick(scene.pointerX, scene.pointerY, (m) => m.isDescendantOf(texturePlaneGroup))
+          if (pick.hit && pick.pickedMesh?.userData?.texturePlane) {
+            selectedTexturePlane = pick.pickedMesh.userData.texturePlane
             selectedPlacedObject = null
             const rep = selectedTexturePlane.uvRepeat || 1
             textureScale = rep
@@ -4145,13 +4149,13 @@ if (key === 'e') {
         }
 
         if (!selectedTexturePlane) {
-          const hits = raycaster.intersectObjects(placedGroup.children, true)
-          if (hits.length) {
-            let obj = hits[0].object
+          const pick = scene.pick(scene.pointerX, scene.pointerY, (m) => m.isDescendantOf(placedGroup))
+          if (pick.hit) {
+            let obj = pick.pickedMesh
             while (obj.parent && obj.parent !== placedGroup) obj = obj.parent
             selectedPlacedObject = obj
             selectedTexturePlane = null
-      selectedTexturePlanes = []
+            selectedTexturePlanes = []
             setTool(ToolMode.SELECT)
             updateSelectionHelper()
           }
@@ -4259,18 +4263,14 @@ if (key === 'e') {
       filteredTextures = [...textureRegistry].sort((a, b) => a.name.localeCompare(b.name))
 
       for (const tex of textureRegistry) {
-        const loadedTexture = await new Promise((resolve, reject) => {
-          textureLoader.load(tex.path, resolve, undefined, reject)
-        })
-        loadedTexture.wrapS = THREE.ClampToEdgeWrapping
-        loadedTexture.wrapT = THREE.ClampToEdgeWrapping
+        const loadedTexture = new Texture(tex.path, scene)
+        loadedTexture.wrapU = Texture.CLAMP_ADDRESSMODE
+        loadedTexture.wrapV = Texture.CLAMP_ADDRESSMODE
         textureCache.set(tex.id, loadedTexture)
 
-        const img = loadedTexture.image
-        textureMeta.set(tex.id, {
-          width:  img?.naturalWidth  || img?.width  || 64,
-          height: img?.naturalHeight || img?.height || 64
-        })
+        // Get image dimensions via onload
+        const meta = await loadImageMeta(tex.path)
+        textureMeta.set(tex.id, meta)
       }
 
       selectedTextureId = filteredTextures[0]?.id || null
@@ -4313,26 +4313,17 @@ if (key === 'e') {
 
   Promise.all([initAssets(), initTextures()]).then(() => initDefaultSave())
 
-  function animate() {
-    requestAnimationFrame(animate)
+  engine.runRenderLoop(() => {
     if (_terrainDirty) {
       rebuildTerrain({ ..._terrainDirtyOpts, _heightsOnlyRegion: _terrainDirtyRegion })
       _terrainDirty = false
       _terrainDirtyRegion = null
       _terrainDirtyOpts = { skipTexturePlanes: true, skipShadows: true, skipTextureOverlays: true }
     }
-    if (Array.isArray(selectionHelper)) {
-      for (const h of selectionHelper) h.update()
-    } else if (selectionHelper) {
-      selectionHelper.update()
-    }
-    clock.update()
-    const delta = clock.getDelta()
-    for (const mixer of mixers.values()) mixer.update(delta)
+    // Selection helpers are recreated on change, no per-frame update needed
     const t = performance.now() * 0.0003
-    waterTexture.offset.set(t * 0.18, t * 0.09)
-    renderer.render(scene, camera)
-  }
-
-  animate()
+    waterTexture.uOffset = t * 0.18
+    waterTexture.vOffset = t * 0.09
+    scene.render()
+  })
 }

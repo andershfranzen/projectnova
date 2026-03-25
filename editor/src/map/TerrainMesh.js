@@ -1,4 +1,11 @@
-import * as THREE from 'three'
+import { Mesh } from '@babylonjs/core/Meshes/mesh'
+import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder'
+import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData'
+import { VertexBuffer } from '@babylonjs/core/Buffers/buffer'
+import { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial'
+import { Color3 } from '@babylonjs/core/Maths/math.color'
+import { TransformNode } from '@babylonjs/core/Meshes/transformNode'
+import { Texture } from '@babylonjs/core/Materials/Textures/texture'
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value))
@@ -11,41 +18,25 @@ function sampleNoise(x, z, scaleA = 1, scaleB = 1) {
   ) * 0.5
 }
 
+// Returns plain {r, g, b} object (no engine dependency)
 function groundColor(type, shade) {
-  if (type === 'dirt') {
-    return new THREE.Color(0.45 * shade, 0.31 * shade, 0.14 * shade)
-  }
+  if (type === 'dirt')         return { r: 0.45 * shade, g: 0.31 * shade, b: 0.14 * shade }
+  if (type === 'sand')         return { r: 0.72 * shade, g: 0.60 * shade, b: 0.24 * shade }
+  if (type === 'path')         return { r: 0.42 * shade, g: 0.30 * shade, b: 0.13 * shade }
+  if (type === 'road')         return { r: 0.47 * shade, g: 0.46 * shade, b: 0.43 * shade }
+  if (type === 'water')        return { r: 0.40 * shade, g: 0.47 * shade, b: 0.66 * shade }
+  if (type === 'dungeon-floor') return { r: 0.22 * shade, g: 0.17 * shade, b: 0.11 * shade }
+  if (type === 'dungeon-rock')  return { r: 0.28 * shade, g: 0.20 * shade, b: 0.12 * shade }
+  return { r: 0.13 * shade, g: 0.43 * shade, b: 0.07 * shade } // grass
+}
 
-  if (type === 'sand') {
-    return new THREE.Color(0.72 * shade, 0.60 * shade, 0.24 * shade)
-  }
-
-  if (type === 'path') {
-    return new THREE.Color(0.42 * shade, 0.30 * shade, 0.13 * shade)
-  }
-
-  if (type === 'road') {
-    return new THREE.Color(0.47 * shade, 0.46 * shade, 0.43 * shade)
-  }
-
-  if (type === 'water') {
-    return new THREE.Color(0.40 * shade, 0.47 * shade, 0.66 * shade)
-  }
-
-  if (type === 'dungeon-floor') {
-    return new THREE.Color(0.22 * shade, 0.17 * shade, 0.11 * shade)
-  }
-
-  if (type === 'dungeon-rock') {
-    return new THREE.Color(0.28 * shade, 0.20 * shade, 0.12 * shade)
-  }
-
-  return new THREE.Color(0.13 * shade, 0.43 * shade, 0.07 * shade)
+function colorMultiplyScalar(c, s) {
+  c.r *= s; c.g *= s; c.b *= s
 }
 
 function pushVertex(vertices, colors, uvs, x, y, z, color, u, v) {
   vertices.push(x, y, z)
-  colors.push(color.r, color.g, color.b)
+  colors.push(color.r, color.g, color.b, 1.0) // RGBA for Babylon.js
   uvs.push(u, v)
 }
 
@@ -88,8 +79,6 @@ function shouldRenderWater(map, x, z) {
   return map.isWaterTile(x, z)
 }
 
-// Returns 0-1: how close vertex (vx,vz) is to the nearest water tile.
-// 5x5 window (25 lookups) gives a ~2.5-tile gradient without heavy cost.
 function getVertexWaterProximity(map, vx, vz) {
   let maxProx = 0
   for (let dz = -2; dz <= 2; dz++) {
@@ -107,9 +96,6 @@ function getVertexWaterProximity(map, vx, vz) {
   return maxProx
 }
 
-
-// Returns 0-1: how strongly this vertex is near a height cliff.
-// Checks all 8 surrounding vertices for the largest height difference.
 function getVertexCliffStrength(map, vx, vz) {
   const h = map.getVertexHeight(vx, vz)
   let maxDiff = 0
@@ -142,7 +128,6 @@ function getNoiseExtra(type, vx, vz) {
   return 0
 }
 
-// Average the slope shades of all tiles sharing this vertex for smooth lighting transitions
 function getVertexSlopeShade(map, vx, vz) {
   const sharingTiles = [
     [vx - 1, vz - 1],
@@ -162,7 +147,6 @@ function getVertexSlopeShade(map, vx, vz) {
   return count > 0 ? total / count : 1.0
 }
 
-// Darken vertices that sit lower than their neighbours (valley ambient occlusion)
 function getVertexAO(map, vx, vz) {
   const h = map.getVertexHeight(vx, vz)
   let sum = 0, count = 0
@@ -173,14 +157,11 @@ function getVertexAO(map, vx, vz) {
     count++
   }
   if (count === 0) return 1.0
-  const depression = (sum / count) - h  // positive = vertex is lower than neighbours
+  const depression = (sum / count) - h
   return 1.0 - clamp(depression * 0.16, 0, 0.40)
 }
 
 function getCornerBlendedColor(map, cornerX, cornerZ, shade) {
-  // Average the ground colors of all tiles sharing this corner.
-  // Noise is also blended here using the same weights so that both tiles
-  // sharing a vertex always produce the same output color — no seams.
   const sharingTiles = [
     [cornerX - 1, cornerZ - 1],
     [cornerX,     cornerZ - 1],
@@ -192,7 +173,7 @@ function getCornerBlendedColor(map, cornerX, cornerZ, shade) {
   for (const [nx, nz] of sharingTiles) {
     if (!map.getTile(nx, nz)) continue
     const type = map.getBaseGroundType(nx, nz)
-    if (type === 'road') continue  // road doesn't bleed into neighbours
+    if (type === 'road') continue
     const w = 1.0
     const c = groundColor(type, 1.0)
     r += c.r * w; g += c.g * w; b += c.b * w
@@ -202,16 +183,14 @@ function getCornerBlendedColor(map, cornerX, cornerZ, shade) {
 
   if (totalWeight === 0) return groundColor('grass', shade)
   const s = shade + noise / totalWeight
-  return new THREE.Color((r / totalWeight) * s, (g / totalWeight) * s, (b / totalWeight) * s)
+  return { r: (r / totalWeight) * s, g: (g / totalWeight) * s, b: (b / totalWeight) * s }
 }
 
 function avgColor(a, b, c) {
-  return new THREE.Color((a.r + b.r + c.r) / 3, (a.g + b.g + c.g) / 3, (a.b + b.b + c.b) / 3)
+  return { r: (a.r + b.r + c.r) / 3, g: (a.g + b.g + c.g) / 3, b: (a.b + b.b + c.b) / 3 }
 }
 
 // --- Per-rebuild vertex cache ---
-// Interior vertices are shared by up to 4 tiles; caching avoids recomputing each one 4×.
-// Sentinel value -1 means "not yet computed". Initialized at the start of buildTerrainMeshes.
 let _vcCols = 0
 let _vcWaterProx  = null
 let _vcCliffStr   = null
@@ -248,11 +227,11 @@ function _cvSlopeShade(map, vx, vz) {
   return _vcSlopeShade[i]
 }
 
-// --- Persistent land geometry for partial height-only updates ---
-let _landGeo = null
-let _landPosBuf = null   // Float32Array backing position attribute
-let _landColBuf = null   // Float32Array backing color attribute
-let _landTileOff = null  // Int32Array: [z * width + x] = first vertex index for this tile
+// --- Persistent land mesh for partial height-only updates ---
+let _landMesh = null
+let _landPosBuf = null
+let _landColBuf = null
+let _landTileOff = null
 let _landMapW = 0
 let _landMapH = 0
 
@@ -289,7 +268,6 @@ function addTileGeometry(vertices, colors, uvs, indices, base, tileType, h, x, z
     const proxBL = _cvWaterProx(map, x,     z + 1)
     const proxBR = _cvWaterProx(map, x + 1, z + 1)
 
-    // Mud tint — horizontal gradient toward water
     const applyMud = (c, t) => {
       if (t <= 0) return
       c.r *= 1 + t * 0.18
@@ -301,7 +279,6 @@ function addTileGeometry(vertices, colors, uvs, indices, base, tileType, h, x, z
     applyMud(cBL, proxBL)
     applyMud(cBR, proxBR)
 
-    // Underwater darkening — vertices below water level fade toward a deep murky colour
     const applyDepth = (c, vertH) => {
       const depth = clamp((wLevel - vertH) / 2.5, 0, 1)
       if (depth <= 0) return
@@ -328,26 +305,22 @@ function addTileGeometry(vertices, colors, uvs, indices, base, tileType, h, x, z
     applyCliffTint(cBR, _cvCliffStr(map, x + 1, z + 1))
   }
 
-
-  // Valley ambient occlusion — darken vertices lower than their surroundings
   if (tileType !== 'water') {
-    cTL.multiplyScalar(_cvAO(map, x,     z    ))
-    cTR.multiplyScalar(_cvAO(map, x + 1, z    ))
-    cBL.multiplyScalar(_cvAO(map, x,     z + 1))
-    cBR.multiplyScalar(_cvAO(map, x + 1, z + 1))
+    colorMultiplyScalar(cTL, _cvAO(map, x,     z    ))
+    colorMultiplyScalar(cTR, _cvAO(map, x + 1, z    ))
+    colorMultiplyScalar(cBL, _cvAO(map, x,     z + 1))
+    colorMultiplyScalar(cBR, _cvAO(map, x + 1, z + 1))
   }
 
-  // Object proximity shadow — darken terrain near placed assets (RS2 style)
   const shadowableType = tileType === 'grass' || tileType === 'dirt' || tileType === 'path'
   if (shadowableType && shadowInf) {
-    cTL.multiplyScalar(shadowInf[z    ][x    ])
-    cTR.multiplyScalar(shadowInf[z    ][x + 1])
-    cBL.multiplyScalar(shadowInf[z + 1][x    ])
-    cBR.multiplyScalar(shadowInf[z + 1][x + 1])
+    colorMultiplyScalar(cTL, shadowInf[z    ][x    ])
+    colorMultiplyScalar(cTR, shadowInf[z    ][x + 1])
+    colorMultiplyScalar(cBL, shadowInf[z + 1][x    ])
+    colorMultiplyScalar(cBR, shadowInf[z + 1][x + 1])
   }
 
   if (groundBType && groundBType !== tileType) {
-    // Split tile: flat solid color per triangle, no corner blending
     const noiseA = getNoiseExtra(tileType, x + 0.25, z + 0.25)
     const noiseB = getNoiseExtra(groundBType, x + 0.75, z + 0.75)
     const cA = groundColor(tileType, Math.max(slopeShade + noiseA, 0.5))
@@ -358,24 +331,20 @@ function addTileGeometry(vertices, colors, uvs, indices, base, tileType, h, x, z
     const avgShadow = shadowInf
       ? (shadowInf[z][x] + shadowInf[z][x+1] + shadowInf[z+1][x] + shadowInf[z+1][x+1]) / 4
       : 1.0
-    cA.multiplyScalar(avgAO * (shadowableA && shadowInf ? avgShadow : 1.0))
-    cB.multiplyScalar(avgAO * (shadowableB && shadowInf ? avgShadow : 1.0))
+    colorMultiplyScalar(cA, avgAO * (shadowableA && shadowInf ? avgShadow : 1.0))
+    colorMultiplyScalar(cB, avgAO * (shadowableB && shadowInf ? avgShadow : 1.0))
 
     if (splitDir === 'forward') {
-      // Triangle A (tileType): TL, BL, TR
       pushVertex(vertices, colors, uvs, x,     h.tl, z,     cA, 0, 0)
       pushVertex(vertices, colors, uvs, x,     h.bl, z + 1, cA, 0, 1)
       pushVertex(vertices, colors, uvs, x + 1, h.tr, z,     cA, 1, 0)
-      // Triangle B (groundBType): BL, BR, TR
       pushVertex(vertices, colors, uvs, x,     h.bl, z + 1, cB, 0, 1)
       pushVertex(vertices, colors, uvs, x + 1, h.br, z + 1, cB, 1, 1)
       pushVertex(vertices, colors, uvs, x + 1, h.tr, z,     cB, 1, 0)
     } else {
-      // Triangle A (tileType): TL, BL, BR
       pushVertex(vertices, colors, uvs, x,     h.tl, z,     cA, 0, 0)
       pushVertex(vertices, colors, uvs, x,     h.bl, z + 1, cA, 0, 1)
       pushVertex(vertices, colors, uvs, x + 1, h.br, z + 1, cA, 1, 1)
-      // Triangle B (groundBType): TL, BR, TR
       pushVertex(vertices, colors, uvs, x,     h.tl, z,     cB, 0, 0)
       pushVertex(vertices, colors, uvs, x + 1, h.br, z + 1, cB, 1, 1)
       pushVertex(vertices, colors, uvs, x + 1, h.tr, z,     cB, 1, 0)
@@ -398,7 +367,34 @@ function addTileGeometry(vertices, colors, uvs, indices, base, tileType, h, x, z
   return 4
 }
 
-export function buildTerrainMeshes(map, waterTexture, shadowInf = null) {
+// Helper: create a Babylon.js mesh from raw vertex data arrays
+function createMeshFromArrays(name, positions, colors4, uvs, indices, scene, updatable = false) {
+  const mesh = new Mesh(name, scene)
+  const vertexData = new VertexData()
+  vertexData.positions = positions
+  vertexData.indices = indices
+  if (colors4 && colors4.length > 0) vertexData.colors = colors4
+  if (uvs && uvs.length > 0) vertexData.uvs = uvs
+  const normals = []
+  VertexData.ComputeNormals(positions, indices, normals)
+  vertexData.normals = normals
+  vertexData.applyToMesh(mesh, updatable)
+  mesh.hasVertexAlpha = false
+  return mesh
+}
+
+function createLambertMaterial(name, scene, opts = {}) {
+  const mat = new StandardMaterial(name, scene)
+  mat.specularColor = new Color3(0, 0, 0)
+  mat.backFaceCulling = opts.backFaceCulling !== undefined ? opts.backFaceCulling : true
+  if (opts.alpha !== undefined) mat.alpha = opts.alpha
+  if (opts.zOffset !== undefined) mat.zOffset = opts.zOffset
+  if (opts.diffuseColor) mat.diffuseColor = opts.diffuseColor
+  if (opts.diffuseTexture) mat.diffuseTexture = opts.diffuseTexture
+  return mat
+}
+
+export function buildTerrainMeshes(map, waterTexture, shadowInf = null, scene) {
   _initVertexCache(map)
 
   const landVertices = []
@@ -423,22 +419,12 @@ export function buildTerrainMeshes(map, waterTexture, shadowInf = null) {
       const landType = map.getBaseGroundType(x, z)
 
       landBase += addTileGeometry(
-        landVertices,
-        landColors,
-        landUVs,
-        landIndices,
-        landBase,
-        landType,
-        h,
-        x,
-        z,
-        map,
-        shadowInf
+        landVertices, landColors, landUVs, landIndices,
+        landBase, landType, h, x, z, map, shadowInf
       )
 
       if (shouldRenderWater(map, x, z)) {
         const wY = map.getTileWaterLevel(x, z) + 0.02
-        // World-space UVs so texture flows seamlessly across tile boundaries
         const WATER_UV_SCALE = 5
         const u0 = x / WATER_UV_SCALE
         const u1 = (x + 1) / WATER_UV_SCALE
@@ -446,7 +432,7 @@ export function buildTerrainMeshes(map, waterTexture, shadowInf = null) {
         const v1 = (z + 1) / WATER_UV_SCALE
         const wc = groundColor('water', 1.0)
         waterVertices.push(x, wY, z,  x+1, wY, z,  x, wY, z+1,  x+1, wY, z+1)
-        waterColors.push(wc.r, wc.g, wc.b, wc.r, wc.g, wc.b, wc.r, wc.g, wc.b, wc.r, wc.g, wc.b)
+        waterColors.push(wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1)
         waterUVs.push(u0, v0,  u1, v0,  u0, v1,  u1, v1)
         waterIndices.push(waterBase, waterBase+2, waterBase+1, waterBase+2, waterBase+3, waterBase+1)
         waterBase += 4
@@ -454,14 +440,14 @@ export function buildTerrainMeshes(map, waterTexture, shadowInf = null) {
     }
   }
 
-  // Surface water pass — thin film at terrain height (rice paddies, flooded fields)
+  // Surface water pass (rice paddies, flooded fields)
   const swVertices = []
   const swColors = []
   const swUVs = []
   const swIndices = []
   let swBase = 0
 
-  const _swColor = new THREE.Color(0.55, 0.72, 0.78)
+  const _swColor = { r: 0.55, g: 0.72, b: 0.78 }
   for (let z = 0; z < map.height; z++) {
     for (let x = 0; x < map.width; x++) {
       const tile = map.getTile(x, z)
@@ -470,26 +456,18 @@ export function buildTerrainMeshes(map, waterTexture, shadowInf = null) {
       const h = map.getTileCornerHeights(x, z)
       const LIFT = 0.05
       const WATER_UV_SCALE = 5
-      const u0 = x / WATER_UV_SCALE
-      const u1 = (x + 1) / WATER_UV_SCALE
-      const v0 = z / WATER_UV_SCALE
-      const v1 = (z + 1) / WATER_UV_SCALE
+      const u0 = x / WATER_UV_SCALE, u1 = (x + 1) / WATER_UV_SCALE
+      const v0 = z / WATER_UV_SCALE, v1 = (z + 1) / WATER_UV_SCALE
       const wc = _swColor
-      swVertices.push(
-        x,     h.tl + LIFT, z,
-        x + 1, h.tr + LIFT, z,
-        x,     h.bl + LIFT, z + 1,
-        x + 1, h.br + LIFT, z + 1
-      )
-      swColors.push(wc.r, wc.g, wc.b, wc.r, wc.g, wc.b, wc.r, wc.g, wc.b, wc.r, wc.g, wc.b)
+      swVertices.push(x, h.tl+LIFT, z,  x+1, h.tr+LIFT, z,  x, h.bl+LIFT, z+1,  x+1, h.br+LIFT, z+1)
+      swColors.push(wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1)
       swUVs.push(u0, v0,  u1, v0,  u0, v1,  u1, v1)
-      swIndices.push(swBase, swBase + 2, swBase + 1, swBase + 2, swBase + 3, swBase + 1)
+      swIndices.push(swBase, swBase+2, swBase+1, swBase+2, swBase+3, swBase+1)
       swBase += 4
     }
   }
 
-  const group = new THREE.Group()
-  group.name = 'terrain-group'
+  const group = new TransformNode('terrain-group', scene)
 
   // Store persistent land geometry for partial height-only updates
   _landTileOff = newTileOff
@@ -499,100 +477,56 @@ export function buildTerrainMeshes(map, waterTexture, shadowInf = null) {
   _landColBuf  = new Float32Array(landColors)
 
   if (landVertices.length > 0) {
-    _landGeo = new THREE.BufferGeometry()
-    _landGeo.setAttribute('position', new THREE.BufferAttribute(_landPosBuf, 3))
-    _landGeo.setAttribute('color',    new THREE.BufferAttribute(_landColBuf, 3))
-    _landGeo.setAttribute('uv',       new THREE.Float32BufferAttribute(landUVs, 2))
-    _landGeo.setIndex(landIndices)
-    _landGeo.computeVertexNormals()
-
-    const landMaterial = new THREE.MeshLambertMaterial({
-      vertexColors: true,
-      side: THREE.DoubleSide
-    })
-
-    const landMesh = new THREE.Mesh(_landGeo, landMaterial)
-    landMesh.name = 'terrain-land'
-    landMesh.receiveShadow = true
-    group.add(landMesh)
+    const landMesh = createMeshFromArrays('terrain-land', landVertices, landColors, landUVs, landIndices, scene, true)
+    const landMat = createLambertMaterial('terrain-land-mat', scene, { backFaceCulling: false })
+    landMesh.material = landMat
+    landMesh.parent = group
+    _landMesh = landMesh
   }
 
   if (waterVertices.length > 0) {
-    const waterGeometry = new THREE.BufferGeometry()
-    waterGeometry.setAttribute('position', new THREE.Float32BufferAttribute(waterVertices, 3))
-    waterGeometry.setAttribute('color', new THREE.Float32BufferAttribute(waterColors, 3))
-    waterGeometry.setAttribute('uv', new THREE.Float32BufferAttribute(waterUVs, 2))
-    waterGeometry.setIndex(waterIndices)
-    waterGeometry.computeVertexNormals()
-
-    if (waterTexture) {
-      waterTexture.wrapS = THREE.RepeatWrapping
-      waterTexture.wrapT = THREE.RepeatWrapping
-      waterTexture.colorSpace = THREE.SRGBColorSpace
-    }
-
-    const waterMaterial = new THREE.MeshLambertMaterial({
-      map: waterTexture || null,
-      color: waterTexture ? 0xd4e8ff : 0x6b84b4,
-      vertexColors: true,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.88,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -1
+    const waterMesh = createMeshFromArrays('terrain-water', waterVertices, waterColors, waterUVs, waterIndices, scene)
+    const waterMat = createLambertMaterial('terrain-water-mat', scene, {
+      backFaceCulling: false,
+      alpha: 0.88,
+      zOffset: -1,
+      diffuseColor: waterTexture ? new Color3(0.83, 0.91, 1.0) : new Color3(0.42, 0.52, 0.70),
     })
-
-    const waterMesh = new THREE.Mesh(waterGeometry, waterMaterial)
-    waterMesh.name = 'terrain-water'
-    waterMesh.receiveShadow = true
-    group.add(waterMesh)
+    if (waterTexture) {
+      waterTexture.wrapU = Texture.WRAP_ADDRESSMODE
+      waterTexture.wrapV = Texture.WRAP_ADDRESSMODE
+      waterMat.diffuseTexture = waterTexture
+    }
+    waterMesh.material = waterMat
+    waterMesh.hasVertexAlpha = true
+    waterMesh.parent = group
   }
 
   if (swVertices.length > 0) {
-    const swGeometry = new THREE.BufferGeometry()
-    swGeometry.setAttribute('position', new THREE.Float32BufferAttribute(swVertices, 3))
-    swGeometry.setAttribute('color', new THREE.Float32BufferAttribute(swColors, 3))
-    swGeometry.setAttribute('uv', new THREE.Float32BufferAttribute(swUVs, 2))
-    swGeometry.setIndex(swIndices)
-    swGeometry.computeVertexNormals()
-
-    let swTexture = null
+    const swMesh = createMeshFromArrays('terrain-surface-water', swVertices, swColors, swUVs, swIndices, scene)
+    let swTex = null
     if (waterTexture) {
-      swTexture = waterTexture.clone()
-      swTexture.image = waterTexture.image
-      swTexture.wrapS = THREE.RepeatWrapping
-      swTexture.wrapT = THREE.RepeatWrapping
-      swTexture.colorSpace = THREE.SRGBColorSpace
-      swTexture.offset.set(0, 0)
-      if (swTexture.image) swTexture.needsUpdate = true
+      swTex = waterTexture.clone()
+      swTex.wrapU = Texture.WRAP_ADDRESSMODE
+      swTex.wrapV = Texture.WRAP_ADDRESSMODE
     }
-
-    const swMaterial = new THREE.MeshLambertMaterial({
-      map: swTexture || null,
-      color: swTexture ? 0xe0f4f8 : 0x8ac8d8,
-      vertexColors: true,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.25,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -2
+    const swMat = createLambertMaterial('terrain-sw-mat', scene, {
+      backFaceCulling: false,
+      alpha: 0.25,
+      zOffset: -2,
+      diffuseColor: swTex ? new Color3(0.88, 0.96, 0.97) : new Color3(0.54, 0.78, 0.85),
     })
-
-    const swMesh = new THREE.Mesh(swGeometry, swMaterial)
-    swMesh.name = 'terrain-surface-water'
-    group.add(swMesh)
+    if (swTex) swMat.diffuseTexture = swTex
+    swMesh.material = swMat
+    swMesh.hasVertexAlpha = true
+    swMesh.parent = group
   }
 
   return group
 }
 
-// Rebuild only the water + surface-water meshes (used in the heights-only fast path).
-// Returns a Group containing just those meshes so the caller can swap them out of terrainGroup.
-export function buildWaterMeshes(map, waterTexture) {
-  const group = new THREE.Group()
-  group.name = 'terrain-water-group'
+export function buildWaterMeshes(map, waterTexture, scene) {
+  const group = new TransformNode('terrain-water-group', scene)
 
   const waterVertices = []
   const waterColors   = []
@@ -609,7 +543,7 @@ export function buildWaterMeshes(map, waterTexture) {
       const v0 = z / WATER_UV_SCALE, v1 = (z + 1) / WATER_UV_SCALE
       const wc = groundColor('water', 1.0)
       waterVertices.push(x, wY, z,  x+1, wY, z,  x, wY, z+1,  x+1, wY, z+1)
-      waterColors.push(wc.r, wc.g, wc.b, wc.r, wc.g, wc.b, wc.r, wc.g, wc.b, wc.r, wc.g, wc.b)
+      waterColors.push(wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1)
       waterUVs.push(u0, v0,  u1, v0,  u0, v1,  u1, v1)
       waterIndices.push(waterBase, waterBase+2, waterBase+1, waterBase+2, waterBase+3, waterBase+1)
       waterBase += 4
@@ -617,37 +551,26 @@ export function buildWaterMeshes(map, waterTexture) {
   }
 
   if (waterVertices.length > 0) {
-    const geo = new THREE.BufferGeometry()
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(waterVertices, 3))
-    geo.setAttribute('color',    new THREE.Float32BufferAttribute(waterColors, 3))
-    geo.setAttribute('uv',       new THREE.Float32BufferAttribute(waterUVs, 2))
-    geo.setIndex(waterIndices)
-    geo.computeVertexNormals()
+    const mesh = createMeshFromArrays('terrain-water', waterVertices, waterColors, waterUVs, waterIndices, scene)
     if (waterTexture) {
-      waterTexture.wrapS = THREE.RepeatWrapping
-      waterTexture.wrapT = THREE.RepeatWrapping
-      waterTexture.colorSpace = THREE.SRGBColorSpace
+      waterTexture.wrapU = Texture.WRAP_ADDRESSMODE
+      waterTexture.wrapV = Texture.WRAP_ADDRESSMODE
     }
-    const mat = new THREE.MeshLambertMaterial({
-      map: waterTexture || null,
-      color: waterTexture ? 0xd4e8ff : 0x6b84b4,
-      vertexColors: true,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.88,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -1
+    const mat = createLambertMaterial('terrain-water-mat', scene, {
+      backFaceCulling: false,
+      alpha: 0.88,
+      zOffset: -1,
+      diffuseColor: waterTexture ? new Color3(0.83, 0.91, 1.0) : new Color3(0.42, 0.52, 0.70),
     })
-    const mesh = new THREE.Mesh(geo, mat)
-    mesh.name = 'terrain-water'
-    mesh.receiveShadow = true
-    group.add(mesh)
+    if (waterTexture) mat.diffuseTexture = waterTexture
+    mesh.material = mat
+    mesh.hasVertexAlpha = false
+    mesh.parent = group
   }
 
   const swVertices = [], swColors = [], swUVs = [], swIndices = []
   let swBase = 0
-  const _swColor = new THREE.Color(0.55, 0.72, 0.78)
+  const _swColor = { r: 0.55, g: 0.72, b: 0.78 }
   for (let z = 0; z < map.height; z++) {
     for (let x = 0; x < map.width; x++) {
       const tile = map.getTile(x, z)
@@ -658,7 +581,7 @@ export function buildWaterMeshes(map, waterTexture) {
       const v0 = z / WATER_UV_SCALE, v1 = (z + 1) / WATER_UV_SCALE
       const wc = _swColor
       swVertices.push(x, h.tl+LIFT, z,  x+1, h.tr+LIFT, z,  x, h.bl+LIFT, z+1,  x+1, h.br+LIFT, z+1)
-      swColors.push(wc.r, wc.g, wc.b, wc.r, wc.g, wc.b, wc.r, wc.g, wc.b, wc.r, wc.g, wc.b)
+      swColors.push(wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1, wc.r, wc.g, wc.b, 1)
       swUVs.push(u0, v0,  u1, v0,  u0, v1,  u1, v1)
       swIndices.push(swBase, swBase+2, swBase+1, swBase+2, swBase+3, swBase+1)
       swBase += 4
@@ -666,41 +589,29 @@ export function buildWaterMeshes(map, waterTexture) {
   }
 
   if (swVertices.length > 0) {
-    const geo = new THREE.BufferGeometry()
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(swVertices, 3))
-    geo.setAttribute('color',    new THREE.Float32BufferAttribute(swColors, 3))
-    geo.setAttribute('uv',       new THREE.Float32BufferAttribute(swUVs, 2))
-    geo.setIndex(swIndices)
-    geo.computeVertexNormals()
+    const mesh = createMeshFromArrays('terrain-surface-water', swVertices, swColors, swUVs, swIndices, scene)
     let swTex = null
     if (waterTexture) {
       swTex = waterTexture.clone()
-      swTex.image = waterTexture.image
-      swTex.wrapS = THREE.RepeatWrapping
-      swTex.wrapT = THREE.RepeatWrapping
-      swTex.colorSpace = THREE.SRGBColorSpace
-      if (swTex.image) swTex.needsUpdate = true
+      swTex.wrapU = Texture.WRAP_ADDRESSMODE
+      swTex.wrapV = Texture.WRAP_ADDRESSMODE
     }
-    const mat = new THREE.MeshLambertMaterial({
-      map: swTex || null,
-      color: swTex ? 0xe0f4f8 : 0x8ac8d8,
-      vertexColors: true,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.25,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -2
+    const mat = createLambertMaterial('terrain-sw-mat', scene, {
+      backFaceCulling: false,
+      alpha: 0.25,
+      zOffset: -2,
+      diffuseColor: swTex ? new Color3(0.88, 0.96, 0.97) : new Color3(0.54, 0.78, 0.85),
     })
-    const mesh = new THREE.Mesh(geo, mat)
-    mesh.name = 'terrain-surface-water'
-    group.add(mesh)
+    if (swTex) mat.diffuseTexture = swTex
+    mesh.material = mat
+    mesh.hasVertexAlpha = false
+    mesh.parent = group
   }
 
   return group
 }
 
-export function buildCliffMeshes(map) {
+export function buildCliffMeshes(map, scene) {
   const vertices = []
   const indices = []
   const colors = []
@@ -709,13 +620,13 @@ export function buildCliffMeshes(map) {
   function cliffColor(topY, bottomY) {
     const drop = Math.max(0, topY - bottomY)
     const shade = clamp(0.92 - drop * 0.12, 0.42, 0.92)
-    return new THREE.Color(0.37 * shade, 0.29 * shade, 0.12 * shade)
+    return { r: 0.37 * shade, g: 0.29 * shade, b: 0.12 * shade }
   }
 
   function pushColoredQuad(a, b, c, d, color) {
     vertices.push(...a, ...b, ...c, ...d)
     for (let i = 0; i < 4; i++) {
-      colors.push(color.r, color.g, color.b)
+      colors.push(color.r, color.g, color.b, 1.0)
     }
     indices.push(
       base + 0, base + 2, base + 1,
@@ -750,22 +661,15 @@ export function buildCliffMeshes(map) {
   for (let z = 0; z < map.height; z++) {
     for (let x = 0; x < map.width; x++) {
       const h = map.getTileCornerHeights(x, z)
-
       const wLevel = map.getTileWaterLevel(x, z)
 
       const rightTile = map.getTile(x + 1, z)
       if (rightTile) {
         const rh = map.getTileCornerHeights(x + 1, z)
-
-        const aTop1 = h.tr
-        const aTop2 = h.br
-        const bTop1 = rh.tl
-        const bTop2 = rh.bl
-
+        const aTop1 = h.tr, aTop2 = h.br
+        const bTop1 = rh.tl, bTop2 = rh.bl
         const avgA = (aTop1 + aTop2) * 0.5
         const avgB = (bTop1 + bTop2) * 0.5
-
-        // Skip cliff if the taller side is submerged — wall would be hidden under water and creates visible squares
         if (Math.abs(avgA - avgB) > 0.01 && Math.max(avgA, avgB) > wLevel) {
           if (avgA > avgB) {
             addVerticalFace(x + 1, z, aTop1, aTop2, bTop1, bTop2, true)
@@ -778,15 +682,10 @@ export function buildCliffMeshes(map) {
       const downTile = map.getTile(x, z + 1)
       if (downTile) {
         const dh = map.getTileCornerHeights(x, z + 1)
-
-        const aTop1 = h.bl
-        const aTop2 = h.br
-        const bTop1 = dh.tl
-        const bTop2 = dh.tr
-
+        const aTop1 = h.bl, aTop2 = h.br
+        const bTop1 = dh.tl, bTop2 = dh.tr
         const avgA = (aTop1 + aTop2) * 0.5
         const avgB = (bTop1 + bTop2) * 0.5
-
         if (Math.abs(avgA - avgB) > 0.01 && Math.max(avgA, avgB) > wLevel) {
           if (avgA > avgB) {
             addVerticalFace(x, z + 1, aTop1, aTop2, bTop1, bTop2, false)
@@ -798,20 +697,12 @@ export function buildCliffMeshes(map) {
     }
   }
 
-  const geometry = new THREE.BufferGeometry()
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3))
-  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3))
-  geometry.setIndex(indices)
-  geometry.computeVertexNormals()
+  if (vertices.length === 0) return null
 
-  const material = new THREE.MeshLambertMaterial({
-    vertexColors: true,
-    flatShading: true,
-    side: THREE.DoubleSide
-  })
-
-  const mesh = new THREE.Mesh(geometry, material)
-  mesh.name = 'cliffs'
+  const mesh = createMeshFromArrays('cliffs', vertices, colors, null, indices, scene)
+  const mat = createLambertMaterial('cliffs-mat', scene, { backFaceCulling: false })
+  mesh.material = mat
+  mesh.hasVertexAlpha = true
   return mesh
 }
 
@@ -844,16 +735,11 @@ function scaledRotatedUVs(rotation, scale) {
   })
 }
 
-// Partially update the land mesh's positions and colors for tiles in the given region.
-// Only valid when tile ground types (and thus vertex counts) haven't changed — i.e. terrain-tool height edits.
-// Returns true if the update was applied, false if a full rebuild is needed instead.
 export function updateTerrainLandHeights(map, shadowInf, x1, z1, x2, z2) {
-  if (!_landGeo || !_landTileOff || _landMapW !== map.width || _landMapH !== map.height) return false
+  if (!_landMesh || !_landTileOff || _landMapW !== map.width || _landMapH !== map.height) return false
 
   _initVertexCache(map)
 
-  // Expand region to cover neighbor-sampling ranges:
-  // getVertexWaterProximity looks 2 tiles out, getCornerBlendedColor/slopeShade look 1 tile out.
   const margin = 3
   const rx1 = Math.max(0, x1 - margin)
   const rz1 = Math.max(0, z1 - margin)
@@ -871,28 +757,31 @@ export function updateTerrainLandHeights(map, shadowInf, x1, z1, x2, z2) {
       tmpV.length = 0; tmpC.length = 0; tmpU.length = 0; tmpI.length = 0
       const vertCount = addTileGeometry(tmpV, tmpC, tmpU, tmpI, 0, landType, h, x, z, map, shadowInf)
 
-      const base = off * 3
+      // Update position buffer (3 components per vertex)
+      const posBase = off * 3
       for (let i = 0; i < vertCount * 3; i++) {
-        _landPosBuf[base + i] = tmpV[i]
-        _landColBuf[base + i] = tmpC[i]
+        _landPosBuf[posBase + i] = tmpV[i]
+      }
+      // Update color buffer (4 components per vertex — RGBA)
+      const colBase = off * 4
+      for (let i = 0; i < vertCount * 4; i++) {
+        _landColBuf[colBase + i] = tmpC[i]
       }
     }
   }
 
-  _landGeo.attributes.position.needsUpdate = true
-  _landGeo.attributes.color.needsUpdate = true
+  _landMesh.updateVerticesData(VertexBuffer.PositionKind, _landPosBuf)
+  _landMesh.updateVerticesData(VertexBuffer.ColorKind, _landColBuf)
   return true
 }
 
-export function buildTextureOverlays(map, textureRegistry, textureCache) {
-  const group = new THREE.Group()
-  group.name = 'texture-overlays'
+export function buildTextureOverlays(map, textureRegistry, textureCache, scene) {
+  const group = new TransformNode('texture-overlays', scene)
 
   for (let z = 0; z < map.height; z++) {
     for (let x = 0; x < map.width; x++) {
       const tile = map.getTile(x, z)
       if (!tile || (!tile.textureId && !tile.textureIdB)) continue
-      // textureHalfMode with both null means fully erased half-painted tile — skip
 
       const h = map.getTileCornerHeights(x, z)
       const overlayOffset = 0.008
@@ -918,30 +807,27 @@ export function buildTextureOverlays(map, textureRegistry, textureCache) {
         return [uv[0][0], uv[0][1], uv[1][0], uv[1][1], uv[2][0], uv[2][1], uv[3][0], uv[3][1]]
       }
 
-      const addMesh = (textureId, rotation, scale, worldUV, indices) => {
+      const addMesh = (textureId, rotation, scale, worldUV, idxs) => {
         const textureInfo = textureRegistry.find((t) => t.id === textureId)
         if (!textureInfo) return
         const texture = textureCache.get(textureInfo.id)
         if (!texture) return
 
-        texture.wrapS = THREE.RepeatWrapping
-        texture.wrapT = THREE.RepeatWrapping
-        texture.colorSpace = THREE.SRGBColorSpace
+        texture.wrapU = Texture.WRAP_ADDRESSMODE
+        texture.wrapV = Texture.WRAP_ADDRESSMODE
 
-        const geometry = new THREE.BufferGeometry()
-        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
-        geometry.setAttribute('uv', new THREE.Float32BufferAttribute(makeUVs(rotation, scale, worldUV), 2))
-        geometry.setIndex(indices)
-        geometry.computeVertexNormals()
-
-        group.add(new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
-          map: texture,
-          transparent: true,
-          color: new THREE.Color(0.82, 0.82, 0.82),
-          polygonOffset: true,
-          polygonOffsetFactor: -2,
-          polygonOffsetUnits: -2
-        })))
+        const mesh = createMeshFromArrays(`texoverlay_${x}_${z}`, positions, null, makeUVs(rotation, scale, worldUV), idxs, scene)
+        const mat = new StandardMaterial(`texoverlay_mat_${x}_${z}`, scene)
+        mat.emissiveTexture = texture
+        mat.emissiveColor = new Color3(0.82, 0.82, 0.82)
+        mat.diffuseColor = new Color3(0, 0, 0)
+        mat.specularColor = new Color3(0, 0, 0)
+        mat.disableLighting = true
+        mat.useAlphaFromDiffuseTexture = false
+        mat.opacityTexture = texture
+        mat.zOffset = -2
+        mesh.material = mat
+        mesh.parent = group
       }
 
       if (tile.textureHalfMode) {
@@ -956,9 +842,8 @@ export function buildTextureOverlays(map, textureRegistry, textureCache) {
   return group
 }
 
-export function buildTexturePlanes(map, textureRegistry, textureCache) {
-  const group = new THREE.Group()
-  group.name = 'texture-planes'
+export function buildTexturePlanes(map, textureRegistry, textureCache, scene) {
+  const group = new TransformNode('texture-planes', scene)
 
   for (const plane of map.texturePlanes) {
     const textureInfo = textureRegistry.find((t) => t.id === plane.textureId)
@@ -968,56 +853,52 @@ export function buildTexturePlanes(map, textureRegistry, textureCache) {
     if (!textureSrc) continue
 
     const texture = textureSrc.clone()
-    texture.image = textureSrc.image
     const scale = plane.uvRepeat || 1
 
     const sx = plane.scale?.x ?? 1
     const sy = plane.scale?.y ?? 1
     const width = Math.max(0.01, plane.width || 1)
     const height = Math.max(0.01, plane.height || 1)
-    const actualW = width * sx
-    const actualH = height * sy
 
     const px = plane.position?.x ?? 0
     const py = plane.position?.y ?? 0
     const pz = plane.position?.z ?? 0
-    const ry = plane.rotation?.y ?? 0
 
-    texture.wrapS = THREE.RepeatWrapping
-    texture.wrapT = THREE.RepeatWrapping
-    texture.repeat.set(scale, scale)
-    texture.offset.set(0, 0)
-    texture.colorSpace = THREE.SRGBColorSpace
-    if (texture.image) texture.needsUpdate = true
+    texture.wrapU = Texture.WRAP_ADDRESSMODE
+    texture.wrapV = Texture.WRAP_ADDRESSMODE
+    texture.uScale = scale
+    texture.vScale = scale
 
-    const geometry = new THREE.PlaneGeometry(width, height)
     const isSelected = map.selectedTexturePlaneId === plane.id
 
-    const material = new THREE.MeshBasicMaterial({
-      map: texture,
-      transparent: true,
-      alphaTest: 0.05,
-      side: THREE.DoubleSide,
-      polygonOffset: true,
-      polygonOffsetFactor: -1,
-      polygonOffsetUnits: -1,
-      color: isSelected ? new THREE.Color(0xeaf4ff) : new THREE.Color(0.82, 0.82, 0.82)
-    })
+    const mesh = MeshBuilder.CreatePlane(`texplane_${plane.id}`, {
+      width: width,
+      height: height,
+      sideOrientation: Mesh.DOUBLESIDE
+    }, scene)
 
-    const mesh = new THREE.Mesh(geometry, material)
-    mesh.layers.set(1)
+    const mat = new StandardMaterial(`texplane_mat_${plane.id}`, scene)
+    mat.emissiveTexture = texture
+    mat.emissiveColor = isSelected ? new Color3(0.92, 0.96, 1.0) : new Color3(0.82, 0.82, 0.82)
+    mat.diffuseColor = new Color3(0, 0, 0)
+    mat.specularColor = new Color3(0, 0, 0)
+    mat.disableLighting = true
+    mat.opacityTexture = texture
+    mat.zOffset = -1
+    mesh.material = mat
 
     const rx = plane.rotation?.x ?? 0
+    const ry = plane.rotation?.y ?? 0
     const rz = plane.rotation?.z ?? 0
     const sz = plane.scale?.z ?? 1
 
     mesh.position.set(px, py, pz)
     mesh.rotation.set(rx, ry, rz)
-    mesh.scale.set(sx, sy, sz)
-    mesh.renderOrder = 10
-    mesh.userData.texturePlane = plane
+    mesh.scaling.set(sx, sy, sz)
+    mesh.renderingGroupId = 1
+    mesh.metadata = { texturePlane: plane }
 
-    group.add(mesh)
+    mesh.parent = group
   }
 
   return group
